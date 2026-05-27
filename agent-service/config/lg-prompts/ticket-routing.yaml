@@ -1,0 +1,131 @@
+# State Machine Configuration for Routing Agent
+# Simple routing logic to identify user intent and direct to appropriate specialist
+
+# Global settings
+settings:
+  initial_state: "waiting_for_ticket"
+  terminator_env_var: "AGENT_MESSAGE_TERMINATOR"
+  agent_name: "ticket-review-agent"
+  terminal_state: "end"
+  empty_response_retry_count: 5
+
+# State structure definition
+state_schema:
+  business_fields:
+    routing_decision:
+      type: "string"
+      default: null
+      # Field to store the routing decision for session manager to detect
+    ticket_title:
+      type: "string"
+      default: ""
+      # Zammad ticket subject (from webhook); may be empty
+
+# State definitions
+states:
+  waiting_for_ticket:
+    type: "waiting"
+    transitions:
+      user_input: "classify_user_intent"
+
+  classify_user_intent:
+    type: "llm_processor"
+    temperature: 0.1  # Very deterministic for classification
+    allowed_tools: []  # Classification only — no tools needed
+    uses_tools: "No"  # Scout model fix: forces skip_all_tools=True, sends empty tools array
+    failure_transition: "classify_user_intent"
+    prompt: |
+      You are an agent that reviews new tickets to figure out if the ticket is related to a request to refresh the user's laptop. Be helpful, friendly, and efficient in determining their needs.
+
+      Ticket title (may be empty): "{ticket_title}"
+
+      The user said: "{last_user_message}"
+
+      Analyze their request and determine what they need help with:
+
+      1. LAPTOP_REFRESH — Only when the user is clearly asking about the laptop refresh / replacement program or new company laptop hardware (replacement, upgrade, eligibility, ordering a standard laptop). Short messages like "refresh" or "laptop refresh" count only when they clearly refer to that program, not generic "refresh" in another sense.
+      2. OTHER — Everything else, including any network, connectivity, VPN, Wi‑Fi, email, software, account/access, printer, phone, or general IT issue — even if the ticket title is vague (e.g. "General workplace IT issue"). If the user's message clearly describes a non-hardware issue, respond OTHER regardless of title.
+
+      Always respond OTHER for VPN, network drops, Wi‑Fi, or "disconnecting" unless they explicitly tie it to needing a new/refreshed laptop.
+
+      Examples of OTHER (must not use LAPTOP_REFRESH):
+      - "My VPN keeps disconnecting every few minutes"
+      - "Wi‑Fi won't connect in the office"
+      - "Teams crashes when I join a call"
+      - "I forgot my password"
+
+      Examples of LAPTOP_REFRESH:
+      - "I need a new laptop"
+      - "Am I eligible for a laptop refresh?"
+      - "laptop refresh"
+      - "I want to refresh my laptop"
+      - "hardware refresh" (when clearly about replacing company laptop hardware)
+
+      Respond with exactly one of: LAPTOP_REFRESH or OTHER
+    response_analysis:
+      conditions:
+        - name: "laptop_refresh"
+          trigger_phrases: ["LAPTOP_REFRESH"]
+          actions:
+            - type: "set_field"
+              field_name: "routing_decision"
+              value: "ticket-laptop-refresh"
+            - type: "add_message"
+              message: "laptop-refresh"
+            - type: "transition"
+              target: "handle_laptop_refresh_ticket"
+        - name: "other_request"
+          trigger_phrases: ["OTHER"]
+          actions:
+            - type: "set_field"
+              field_name: "routing_decision"
+              value: "ticket-general-support"
+            - type: "add_message"
+              message: "{last_user_message}"
+            - type: "transition"
+              target: "handle_other_request"
+      default_transition: "handle_other_request"
+
+  # State 3a: Mark laptop refresh ticket in Zammad, then end
+  handle_laptop_refresh_ticket:
+    type: "llm_processor"
+    temperature: 0.1
+    allowed_tools: ["mark_as_agent_managed_laptop_refresh"]
+    failure_transition: "end"
+    prompt: |
+      This ticket has been classified as a laptop refresh request.
+      Call the mark_as_agent_managed_laptop_refresh tool to tag this ticket in Zammad as agent-managed.
+      After the tool call succeeds, output exactly: LAPTOP_REFRESH_TAGGED
+    response_analysis:
+      conditions:
+        - name: "tagged"
+          trigger_phrases: ["LAPTOP_REFRESH_TAGGED"]
+          actions:
+            - type: "transition"
+              target: "end"
+      default_transition: "end"
+
+  # State 3b: Handle Other/Unclear Requests — tag and assign to general support agent
+  handle_other_request:
+    type: "llm_processor"
+    temperature: 0.1
+    allowed_tools: ["mark_as_general_agent_managed"]
+    failure_transition: "end"
+    prompt: |
+      This ticket has been classified as a general support request.
+      Call the mark_as_general_agent_managed tool to tag this ticket in Zammad as general-agent-managed.
+      After the tool call succeeds, output exactly: GENERAL_SUPPORT_TAGGED
+    response_analysis:
+      conditions:
+        - name: "tagged"
+          trigger_phrases: ["GENERAL_SUPPORT_TAGGED"]
+          actions:
+            - type: "transition"
+              target: "end"
+      default_transition: "end"
+
+  # End state
+  end:
+    type: "terminal"
+    # No reset_behavior - routing agent should not auto-reset
+    # Session manager will handle routing to specialist agent or create new session if needed

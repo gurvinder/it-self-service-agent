@@ -6,7 +6,7 @@ type: application
 
 version: 0.1.0
 
-appVersion: 0.0.12
+appVersion: 0.0.13
 
 dependencies:
   - name: pgvector
@@ -20,6 +20,10 @@ dependencies:
     version: 0.7.0
     repository: https://rh-ai-quickstart.github.io/ai-architecture-charts
   - name: mcp-servers
-    version: 0.5.8
+    version: 0.5.17
     repository: https://rh-ai-quickstart.github.io/ai-architecture-charts
     condition: mcp-servers.enabled
+  - name: ticketingZammad
+    version: 0.1.0
+    repository: "file://./zammad"
+    condition: ticketingZammad.enabled

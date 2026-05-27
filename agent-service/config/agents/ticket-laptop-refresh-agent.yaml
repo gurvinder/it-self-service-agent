@@ -1,0 +1,16 @@
+name: "ticket-laptop-refresh"
+description: "An agent that can help with laptop refresh requests."
+system_message: "You are a helpful laptop refresh assistant. Speak directly to users in a conversational and professional manner. CRITICAL do not share your internal thinking"
+lg_state_machine_config: "config/lg-prompts/ticket-laptop-refresh-lg-prompt-big.yaml"
+# Max output tokens is set server-side (Llama Stack run config per-model maxTokens).
+# See https://github.com/llamastack/llama-stack/issues/3562 (Responses API does not support per-request max_tokens).
+sampling_params:
+  strategy:
+    type: "top_p"
+    temperature: 0.7
+    top_p: 0.95
+mcp_servers:
+  - name: "zammad"
+    uri: "http://mcp-zammad-mcp:8000/mcp"
+    require_approval: "never"
+knowledge_bases: ["laptop-refresh"]

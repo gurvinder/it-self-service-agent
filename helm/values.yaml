@@ -17,7 +17,8 @@ image:
   # This sets the pull policy for images.
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "0.0.12"
+  # Anchor: bump once here; subchart defaults (e.g. mcp-servers Snow) alias this tag.
+  tag: &releaseImageTag "0.0.13"
 
 # Test Integration Configuration
 testIntegrationEnabled: false
@@ -29,7 +30,7 @@ testIntegrationEnabled: false
 # Database Configuration
 database:
   # Expected migration version that services should wait for
-  expectedMigrationVersion: "001"
+  expectedMigrationVersion: "002"
   
   # Database connection URL - leave empty to use default pgvector service
   # Format: postgresql://username:password@host:port/database
@@ -90,6 +91,18 @@ affinity: {}
 
 llama_stack_url: http://llamastack:8321
 
+# Knowledge Base Configuration
+knowledgeBases:
+  # Optional: seed additional knowledge bases from pre-existing ConfigMaps.
+  # Each ConfigMap's files are registered as a separate knowledge base.
+  # This is additive — built-in KBs from the agent-service image are always registered.
+  #
+  # Example:
+  #   configMaps:
+  #     - name: my-kb-configmap   # Name of the ConfigMap in the same namespace
+  #       kbName: my-custom-kb    # KB name to register under (defaults to ConfigMap name)
+  configMaps: []
+
 # LlamaStack Client Configuration
 # These settings configure both the native LlamaStack client and OpenAI-compatible client
 # By default, clients use Kubernetes auto-injected service discovery environment variables
@@ -109,6 +122,12 @@ llamastack:
 # apiKey: "dummy-key"                 # API key for authentication (default: "dummy-key")
 # openaiBasePath: "/v1/openai/v1"    # Base path for OpenAI-compatible API (default: "/v1/openai/v1")
 # timeout: 120                        # Request timeout in seconds (default: 120)
+
+# NeMo Guardrails Configuration
+# Set enabled: true to activate raw message safety checks via the NeMo Guardrails /v1/guardrail/checks endpoint.
+# Requires NeMo Guardrails to be deployed first: make deploy-nemo-guardrails
+nemoGuardrails:
+  enabled: false
 
 # Safety/Shield Configuration (Llama Guard)
 safety:
@@ -249,7 +268,7 @@ mcp-servers:
       deploymentMode: deployment  # Use standard Deployment (no Toolhive)
       image:
         repository: quay.io/rh-ai-quickstart/self-service-agent-snow-mcp
-        tag: "0.0.12"
+        tag: *releaseImageTag
       port: 8000
       targetPort: 8000
       transport: streamable-http
@@ -268,44 +287,74 @@ mcp-servers:
     oracle-sqlcl:
       enabled: false
 
-    # Zammad MCP server for ticketing integration
+    # Key must differ from "zammad" — that label collides with ticketingZammad subchart pods (same Service selector → MCP connects to random Zammad component → connection refused).
     zammad-mcp:
       enabled: false
       replicas: 1
       deploymentMode: deployment
       image:
-        repository: ghcr.io/basher83/zammad-mcp
-        tag: "1.1.0"
+        repository: quay.io/rh-ai-quickstart/self-service-agent-zammad-mcp
+        tag: *releaseImageTag
       port: 8000
       targetPort: 8000
-      transport: http
-      imagePullPolicy: IfNotPresent
+      transport: streamable-http
+      imagePullPolicy: Always
+      extraContainers:
+        - name: basher-zammad-mcp
+          image: ghcr.io/basher83/zammad-mcp:1.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: basher-http
+              containerPort: 8001
+              protocol: TCP
+          env:
+            - name: ZAMMAD_URL
+              valueFrom:
+                secretKeyRef:
+                  name: self-service-agent-zammad-credentials
+                  key: zammad-api-url
+            - name: ZAMMAD_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: self-service-agent-zammad-credentials
+                  key: zammad-http-token
+            - name: MCP_TRANSPORT
+              value: "http"
+            - name: MCP_HOST
+              value: "127.0.0.1"
+            - name: MCP_PORT
+              value: "8001"
       env:
-        MCP_TRANSPORT: "http"
-        MCP_PORT: "8000"
-        # ZAMMAD_URL and ZAMMAD_HTTP_TOKEN from Secret (zammad.url, zammad.mcp.token)
+        MCP_TRANSPORT: "streamable-http"
+        UVICORN_WORKERS: "2"
+        # No trailing slash: avoids some Basher/streamable-http 307 redirect quirks (see basher_client).
+        ZAMMAD_BASHER_MCP_URL: "http://127.0.0.1:8001/mcp"
+        ZAMMAD_MCP_TIMEOUT_SECONDS: "120"
+        ZAMMAD_GROUP_HUMAN_MANAGED: "human_managed_tickets"
+        ZAMMAD_GROUP_ESCALATED_LAPTOP: "escalated_laptop_refresh_tickets"
+        ZAMMAD_LAPTOP_SPECIALIST_OWNER: "agent.laptop-specialist@example.com"
+        ZAMMAD_SPECIALIST_OWNER: "agent.general@example.com"
+        ZAMMAD_USER_MANAGER_FIELD: "manager_email"
+        # Fallback owner for send_to_manager_review when customer has no manager_email (bootstrap agents below).
+        ZAMMAD_MANAGER_EMAIL: "manager1@example.com"
 
-# Zammad ticketing channel (optional)
-zammad:
+# Zammad ticketing channel (optional). Deploys Zammad as a subchart and injects credentials into pods.
+# Configured by values-ticketing.yaml.
+# Webhook HMAC: set webhookSecret here (also accepts legacy top-level zammad.*). Group/state/tag routing is configured in Zammad triggers only, not in the dispatcher.
+# webhookSecret: When ticketingZammad.enabled is true and this is empty, the chart uses default *ssa-zammad-webhook-default*
+# (see secrets.yaml). Override in production. When ticketing is disabled, zammad-webhook-secret is omitted.
+ticketingZammad:
   enabled: false
   url: "https://zammad.example.com"
   webhookSecret: ""
-  allowedGroups: []
-  aiAgentUserId: null
+  # Optional: Zammad users.id for the API user that posts dispatcher replies — webhook ignores articles they author (feedback loop).
+  aiAgentUserId: ""
+  # Specialist owner emails apply to Zammad MCP tools only — set on mcp-servers.mcp-servers.zammad-mcp.env
+  # (ZAMMAD_LAPTOP_SPECIALIST_OWNER / ZAMMAD_SPECIALIST_OWNER). Customer-visible replies are POSTed by
+  # integration-dispatcher via REST ticket_articles (not MCP tools); From is the assignee when Zammad allows it.
   mcp:
     enabled: false
-    uri: "http://mcp-zammad:8000/mcp"
-  # OpenShift Route for external access to Zammad Web UI (when Zammad is deployed via deploy-zammad)
-  # Requires zammad-nginx service in namespace (created by Zammad chart)
-  externalRoute:
-    enabled: false  # Set to true to create OpenShift Route for Zammad (e.g. when using helm-install-ticketing)
-    serviceName: zammad-nginx  # Override if Zammad chart uses different service name (e.g. zammad-zammad-nginx)
-  # Embed page: nginx serves Zammad chat widget embed snippet + live preview
-  # publicUrl: Zammad base URL for script src (e.g. https://ssa-zammad-<ns>.<cluster>). Set via Makefile when using helm-install-ticketing.
-  embedPage:
-    enabled: false
-    publicUrl: ""  # Required when enabled; e.g. https://ssa-zammad-mynamespace.apps.example.com
-    chatId: 1  # Zammad chat channel ID (Admin → Channels → Chat)
+    uri: "http://mcp-zammad-mcp:8000/mcp"
 
 # Enable/disable the llm-service dependency
 llm-service:
@@ -516,8 +565,10 @@ requestManagement:
   
   # Agent Configuration
   agent:
-    # Default agent ID for routing (can be overridden)
+    # First agent for most channels (Slack, web, email, …); see zammadDefaultAgentId for Zammad.
     defaultAgentId: "routing-agent"
+    # First agent for IntegrationType.ZAMMAD sessions (never falls back to defaultAgentId).
+    zammadDefaultAgentId: "ticket-review-agent"
     # Agent response timeout in seconds
     timeout: 180
     # Always refresh agent mapping from LlamaStack on each request

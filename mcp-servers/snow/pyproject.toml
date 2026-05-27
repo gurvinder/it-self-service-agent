@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
+    "mcp-common",
     "python-multipart>=0.0.22",
     "logging>=0.4.9.6",
     "mcp[cli]>=1.23",
@@ -58,15 +59,22 @@ testpaths = ["tests"]
 python_version = "3.12"
 
 # Configure mypy to use source directories for local packages
-mypy_path = "../../tracing-config/src:../../shared-models/src"
+mypy_path = "../../tracing-config/src:../../shared-models/src:../mcp-common/src"
 
 [[tool.mypy.overrides]]
 module = [
+    "mcp_common.*",
     "opentelemetry.*",
     "shared_models.*",
 ]
 follow_imports = "skip"
 
+# FastMCP decorators use ``AnyFunction`` (``Callable[..., Any]``); mypy strict treats that as an untyped decorator.
+[[tool.mypy.overrides]]
+module = "snow.server"
+disallow_untyped_decorators = false
+
 [tool.uv.sources]
+mcp-common = { path = "../mcp-common" }
 self-service-agent-shared-models = { path = "../../shared-models" }
 tracing-config = { path = "../../tracing-config" }

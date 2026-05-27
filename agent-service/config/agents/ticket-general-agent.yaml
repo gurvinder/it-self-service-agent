@@ -1,0 +1,14 @@
+name: "ticket-general-support"
+description: "An agent that handles general IT support ticket requests."
+system_message: "You are a helpful IT support assistant. Speak directly to users in a conversational and professional manner. CRITICAL do not share your internal thinking"
+lg_state_machine_config: "config/lg-prompts/ticket-general-lg-prompt-small.yaml"
+sampling_params:
+  strategy:
+    type: "top_p"
+    temperature: 0.3
+    top_p: 0.95
+mcp_servers:
+  - name: "zammad"
+    uri: "http://mcp-zammad-mcp:8000/mcp"
+    require_approval: "never"
+knowledge_bases: ["general-support"]

@@ -1,6 +1,6 @@
 # Makefile for RAG Deployment
 ifeq ($(NAMESPACE),)
-ifneq (,$(filter namespace install uninstall helm-install-test helm-install-prod helm-install-demo helm-install-ticketing helm-export-demo helm-export-validate-demo ansible-apply-demo ansible-teardown-demo helm-uninstall helm-status helm-cleanup-eventing helm-cleanup-jobs deploy-email-server undeploy-email-server deploy-zammad undeploy-zammad zammad-set-token zammad-bootstrap-token zammad-trigger-autowizard zammad-update-embed-url print-urls verify-triggers jaeger-deploy jaeger-undeploy test-session-serialization-integration test-session-reclaim-integration test-session-background-reclaim-integration,$(MAKECMDGOALS)))
+ifneq (,$(filter namespace install uninstall helm-install-test helm-install-prod helm-install-demo helm-install-ticketing helm-export-demo helm-export-validate-demo ansible-apply-demo ansible-teardown-demo helm-uninstall helm-status helm-cleanup-eventing helm-cleanup-jobs deploy-email-server undeploy-email-server print-urls verify-triggers jaeger-deploy jaeger-undeploy test-session-serialization-integration test-session-reclaim-integration test-session-background-reclaim-integration,$(MAKECMDGOALS)))
 $(error NAMESPACE is not set)
 endif
 endif
@@ -11,7 +11,7 @@ endif
 # - branches forked from dev: uses '0.0.2-dev' tag (dev builds)
 # - all other branches: uses base version (0.0.2) for stable builds (default)
 # Set VERSION explicitly to override this behavior (e.g., VERSION=latest)
-BASE_VERSION := 0.0.12
+BASE_VERSION := 0.0.13
 DEV_VERSION := $(BASE_VERSION)-dev
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 # Check if branch was forked from dev by comparing how close merge-bases are to branch tip
@@ -74,9 +74,11 @@ REQUEST_MGR_IMG ?= $(REGISTRY)/self-service-agent-request-manager:$(VERSION)
 AGENT_SERVICE_IMG ?= $(REGISTRY)/self-service-agent-service:$(VERSION)
 INTEGRATION_DISPATCHER_IMG ?= $(REGISTRY)/self-service-agent-integration-dispatcher:$(VERSION)
 MCP_SNOW_IMG ?= $(REGISTRY)/self-service-agent-snow-mcp:$(VERSION)
+MCP_ZAMMAD_IMG ?= $(REGISTRY)/self-service-agent-zammad-mcp:$(VERSION)
 MOCK_EVENTING_IMG ?= $(REGISTRY)/self-service-agent-mock-eventing:$(VERSION)
 MOCK_SERVICENOW_IMG ?= $(REGISTRY)/self-service-agent-mock-servicenow:$(VERSION)
 PROMPTGUARD_IMG ?= $(REGISTRY)/self-service-agent-promptguard:$(VERSION)
+ZAMMAD_BOOTSTRAP_IMG ?= $(REGISTRY)/self-service-agent-zammad-bootstrap:$(VERSION)
 
 # For retag-all-images: tag from REGISTRY/VERSION to NEW_REGISTRY/NEW_VERSION (set both when retagging)
 NEW_REGISTRY ?=
@@ -100,6 +102,7 @@ MAIN_CHART_NAME := self-service-agent
 HELM_EXPORT_DIR ?= ansible/helm-export
 TOLERATIONS_TEMPLATE=[{"key":"$(1)","effect":"NoSchedule","operator":"Exists"}]
 INGRESS_PREFIX := ssa
+NEMO_GUARDRAILS_CHART ?= helm/nemo-guardrails
 
 # Slack Configuration - only when ENABLE_SLACK set to true
 ifeq ($(ENABLE_SLACK),true)
@@ -239,18 +242,25 @@ helm_demo_email_args = \
 	--set-string security.email.smtpHost=test-email-server-smtp.$(NAMESPACE).svc.cluster.local \
 	--set-string security.email.imapHost=test-email-server-imap.$(NAMESPACE).svc.cluster.local
 
-# Ticketing: Zammad in-cluster URL and MCP secret wiring (exec bootstrap uses railsserver)
+# Ticketing: Zammad in-cluster URL and MCP secret wiring
 ZAMMAD_CREDENTIALS_SECRET ?= $(MAIN_CHART_NAME)-zammad-credentials
-# Must match admin user in helm/values-zammad-deploy.yaml autoWizard.config (for zammad-bootstrap-token / UI login).
+ZAMMAD_URL ?= http://zammad-nginx.$(NAMESPACE).svc.cluster.local:8080
+# Temp overlay file for cluster-specific Zammad Helm values (bootstrap image registry/tag, FQDN, OpenShift UID). Written by helm-install-ticketing.
+ZAMMAD_TICKETING_OVERLAY = /tmp/ssa-zammad-$(NAMESPACE)-overlay.yaml
+# Must match autoWizard.config in helm/values-ticketing.yaml (for UI login).
 ZAMMAD_ADMIN_EMAIL ?= admin@zammad.local
 ZAMMAD_ADMIN_PASSWORD ?= ZammadR0cks!
-ZAMMAD_AUTOWIZARD_TOKEN ?= ssa-zammad-autowizard-9f3a2b1c
+
+# Extra args for helm-install-ticketing: Zammad MCP server image and credentials wiring.
 helm_ticketing_args = \
-	--set zammad.url=$(ZAMMAD_URL) \
+	--set mcp-servers.mcp-servers.zammad-mcp.image.repository=$(REGISTRY)/self-service-agent-zammad-mcp \
+	--set mcp-servers.mcp-servers.zammad-mcp.image.tag=$(VERSION) \
 	--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_URL.name=$(ZAMMAD_CREDENTIALS_SECRET) \
 	--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_URL.key=zammad-url \
 	--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_HTTP_TOKEN.name=$(ZAMMAD_CREDENTIALS_SECRET) \
-	--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_HTTP_TOKEN.key=zammad-http-token
+	--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_HTTP_TOKEN.key=zammad-http-token \
+	$(if $(TEST_USERS),--set-string ticketingZammad.bootstrap.testUsers="$(subst $(COMMA),\$(COMMA),$(TEST_USERS))",) \
+	$(if $(OTEL_EXPORTER_OTLP_ENDPOINT),--set mcp-servers.mcp-servers.zammad-mcp.env.OTEL_EXPORTER_OTLP_ENDPOINT="$(OTEL_EXPORTER_OTLP_ENDPOINT)")
 
 # Version target
 .PHONY: version
@@ -267,8 +277,10 @@ help:
 	@echo "  build-agent-service-image            - Build the agent service container image (checks lockfiles first)"
 	@echo "  build-integration-dispatcher-image   - Build the integration dispatcher container image (checks lockfiles first)"
 	@echo "  build-mcp-snow-image                 - Build the snow MCP server container image (checks lockfiles first)"
+	@echo "  build-mcp-zammad-image               - Build the Zammad MCP server container image (checks lockfiles first)"
 	@echo "  build-mock-eventing-image            - Build the mock eventing service container image (checks lockfiles first)"
 	@echo "  build-mock-servicenow-image          - Build the mock ServiceNow server container image (checks lockfiles first)"
+	@echo "  build-zammad-bootstrap-image         - Build the Zammad bootstrap container image (checks lockfiles first)"
 	@echo "  build-promptguard-image              - Build the PromptGuard service container image (checks lockfiles first)"
 	@echo "  build-request-mgr-image              - Build the request manager container image (checks lockfiles first)"
 	@echo "                                        💡 Tip: If you encounter QEMU issues on Mac M1/M2/M3, add USE_PIP_INSTALL=true"
@@ -278,6 +290,7 @@ help:
 	@echo "  helm-install-prod                   - Install with full Knative eventing (production)"
 	@echo "  helm-install-demo                  - Install demo config (mock eventing, Greenmail, resource constraints)"
 	@echo "  helm-install-ticketing             - Install with ticketing channel (Zammad + MCP; one-shot deploy)"
+	@echo "                                        Optional: TEST_USERS=a@b.com,... seeds extra Zammad customers (bootstrap Job)"
 	@echo "  helm-export-demo                    - Export demo manifests to ansible/helm-export/ (from NAMESPACE, VERSION, REGISTRY, SERVICENOW_*, etc.)"
 	@echo "  helm-export-validate-demo           - Export then validate with kubeconform (no cluster; CI)"
 	@echo "  ansible-apply-demo                  - Export then apply demo via Ansible (requires ansible-playbook)"
@@ -299,6 +312,7 @@ help:
 	@echo "  deps-agent-service                   - Install dependencies for agent service"
 	@echo "  deps-integration-dispatcher          - Install dependencies for integration dispatcher"
 	@echo "  deps-mcp-snow                        - Install dependencies for snow MCP server"
+	@echo "  deps-mcp-zammad                      - Install dependencies for Zammad MCP server"
 	@echo "  deps-request-manager                 - Install dependencies for request manager"
 	@echo "  deps-shared-models                   - Install dependencies for shared models"
 	@echo "  deps-shared-clients                  - Install dependencies for shared clients"
@@ -310,11 +324,12 @@ help:
 	@echo "  deps-evaluations                     - Install dependencies for evaluations"
 	@echo ""
 	@echo "Reinstall Commands:"
-	@echo "  reinstall-all                       - Force reinstall dependencies for all projects (uv sync --reinstall)"
+	@echo "  reinstall-all                       - Force reinstall dependencies for all projects"
 	@echo "  reinstall                           - Force reinstall self-service agent dependencies (uv sync --reinstall)"
 	@echo "  reinstall-agent-service             - Force reinstall agent service dependencies"
 	@echo "  reinstall-integration-dispatcher    - Force reinstall integration dispatcher dependencies"
 	@echo "  reinstall-mcp-snow                  - Force reinstall snow MCP dependencies"
+	@echo "  reinstall-mcp-zammad                - Force reinstall Zammad MCP dependencies"
 	@echo "  reinstall-request-manager           - Force reinstall request manager dependencies"
 	@echo "  reinstall-shared-models             - Force reinstall shared models dependencies"
 	@echo "  reinstall-shared-clients            - Force reinstall shared clients dependencies"
@@ -328,9 +343,11 @@ help:
 	@echo "  pull-agent-service-image            - Pull agent service image"
 	@echo "  pull-integration-dispatcher-image   - Pull integration dispatcher image"
 	@echo "  pull-mcp-snow-image                 - Pull snow MCP image"
+	@echo "  pull-mcp-zammad-image               - Pull Zammad MCP image"
 	@echo "  pull-mock-eventing-image            - Pull mock eventing image"
 	@echo "  pull-mock-servicenow-image          - Pull mock ServiceNow image"
 	@echo "  pull-promptguard-image              - Pull PromptGuard image"
+	@echo "  pull-zammad-bootstrap-image         - Pull Zammad bootstrap image"
 	@echo ""
 	@echo "Retag Commands (pull at REGISTRY/VERSION then tag -> NEW_REGISTRY/NEW_VERSION; set both NEW_* vars):"
 	@echo "  retag-all-images                    - Pull all images, then retag all to NEW_REGISTRY/NEW_VERSION"
@@ -338,15 +355,18 @@ help:
 	@echo "  retag-agent-service-image           - Retag agent service image"
 	@echo "  retag-integration-dispatcher-image  - Retag integration dispatcher image"
 	@echo "  retag-mcp-snow-image                - Retag snow MCP image"
+	@echo "  retag-mcp-zammad-image              - Retag Zammad MCP image"
 	@echo "  retag-mock-eventing-image           - Retag mock eventing image"
 	@echo "  retag-mock-servicenow-image         - Retag mock ServiceNow image"
 	@echo "  retag-promptguard-image             - Retag PromptGuard image"
+	@echo "  retag-zammad-bootstrap-image        - Retag Zammad bootstrap image"
 	@echo ""
 	@echo "Push Commands:"
 	@echo "  push-all-images                     - Push all container images to registry"
 	@echo "  push-agent-service-image            - Push the agent service container image to registry"
 	@echo "  push-integration-dispatcher-image   - Push the integration dispatcher container image to registry"
 	@echo "  push-mcp-snow-image                 - Push the snow MCP server container image to registry"
+	@echo "  push-mcp-zammad-image               - Push the Zammad MCP server container image to registry"
 	@echo "  push-mock-eventing-image            - Push the mock eventing service container image to registry"
 	@echo "  push-promptguard-image              - Push the PromptGuard service container image to registry"
 	@echo "  push-request-mgr-image              - Push the request manager container image to registry"
@@ -367,16 +387,11 @@ help:
 	@echo "Test Email Server Commands:"
 	@echo "  deploy-email-server                 - Deploy test email server (Greenmail with custom UI)"
 	@echo "  undeploy-email-server               - Remove test email server from namespace"
-	@echo "  deploy-zammad                       - Deploy Zammad instance (prerequisite for ticketing channel)"
-	@echo "  undeploy-zammad                     - Remove Zammad instance from namespace"
-	@echo "  zammad-set-token                    - Set Zammad API token in secret and restart MCP (ZAMMAD_TOKEN=xxx, NAMESPACE=)"
-	@echo "  zammad-bootstrap-token              - Create API token via Zammad API (autoWizard admin); update secret and restart MCP"
-	@echo "  zammad-trigger-autowizard           - Trigger autoWizard via HTTP (run before bootstrap if 401)"
-	@echo "  zammad-update-embed-url             - Update embed page with Zammad Route URL (fixes YOUR-ZAMMAD-URL placeholder)"
 	@echo ""
 	@echo "Lockfile Management:"
 	@echo "  check-lockfiles                     - Check if all uv.lock files are up-to-date"
 	@echo "  check-requirements                  - Check if all requirements.txt files exist and are in sync with uv.lock"
+	@echo "  check-release-manifest              - Check Makefile BASE_VERSION vs scripts/bump-release.manifest.json"
 	@echo "  check-uv-version                    - Check if local uv version matches CI requirement ($(UV_VERSION))"
 	@echo "  update-lockfiles                    - Update all uv.lock files; export requirements.txt for dirs in REQUIREMENTS_DIRS"
 	@echo "  export-requirements                - Export requirements.txt for containerized services (REQUIREMENTS_DIRS only)"
@@ -385,6 +400,7 @@ help:
 	@echo "  test-agent-service                  - Run tests for agent service"
 	@echo "  test-integration-dispatcher         - Run tests for integration dispatcher"
 	@echo "  test-mcp-snow                       - Run tests for snow MCP server"
+	@echo "  test-mcp-zammad                     - Run tests for Zammad MCP server"
 	@echo "  test-request-manager                - Run tests for request manager"
 	@echo "  test-shared-models                  - Run tests for shared models"
 	@echo "  test-servicenow-bootstrap          - Run tests for ServiceNow automation scripts"
@@ -435,6 +451,8 @@ help:
 	@echo "    INTEGRATION_DISPATCHER_IMG        - Full integration dispatcher image name (default: \$${REGISTRY}/self-service-agent-integration-dispatcher:\$${VERSION})"
 	@echo "    MCP_SNOW_IMG                      - Full snow MCP image name (default: \$${REGISTRY}/self-service-agent-snow-mcp:\$${VERSION})"
 	@echo "    MOCK_SERVICENOW_IMG               - Full mock ServiceNow image name (default: \$${REGISTRY}/self-service-agent-mock-servicenow:\$${VERSION})"
+	@echo "    ZAMMAD_BOOTSTRAP_IMG              - Full Zammad bootstrap image for build/push/retag (default: \$${REGISTRY}/self-service-agent-zammad-bootstrap:\$${VERSION})"
+	@echo "                                        same REGISTRY/VERSION as helm-install-ticketing bootstrap overlay (not via this var)"
 	@echo "    REQUEST_MGR_IMG                   - Full request manager image name (default: \$${REGISTRY}/self-service-agent-request-manager:\$${VERSION})"
 	@echo "    USE_PIP_INSTALL                   - Use pip install from requirements.txt instead of uv sync (default: false)"
 	@echo "                                        ⚠️  Troubleshooting: If you encounter QEMU segmentation faults when building"
@@ -477,10 +495,15 @@ help:
 	@echo "    LG_PROMPT_<AGENT_NAME>            - Override prompt config for any agent (generic pattern)"
 	@echo "                                        Replace <AGENT_NAME> with uppercase agent name (use _ for -)"
 	@echo "    Examples:"
-	@echo "      LG_PROMPT_LAPTOP_REFRESH        - Override laptop-refresh agent"
+	@echo "      LG_PROMPT_LAPTOP_REFRESH        - Override laptop-refresh agent (non-ticket / general flow)"
+	@echo "      LG_PROMPT_TICKET_LAPTOP_REFRESH - Override ticket-laptop-refresh (Zammad / ticket channel)"
 	@echo "      LG_PROMPT_ROUTING               - Override routing agent"
 	@echo "      LG_PROMPT_EMAIL_UPDATE          - Override email-update agent"
 	@echo "    Usage: make helm-install-test LG_PROMPT_LAPTOP_REFRESH=config/lg-prompts/custom.yaml"
+	@echo ""
+	@echo "  Routing Agent Configuration:"
+	@echo "    DEFAULT_AGENT_ID                  - Override the default routing agent (default: routing-agent)"
+	@echo "    Usage: make helm-install-test DEFAULT_AGENT_ID=my-custom-agent"
 	@echo ""
 	@echo "  Evaluation Configuration:"
 	@echo "    VALIDATE_FULL_LAPTOP_DETAILS    - Enable full laptop details validation (default: true)"
@@ -589,11 +612,11 @@ endef
 check-deps-services-template: check-lockfile-shared-models check-lockfile-shared-clients check-lockfile-agent-service check-lockfile-mock-employee-data
 
 .PHONY: check-deps-mcp-template
-check-deps-mcp-template: check-lockfile-shared-models
+check-deps-mcp-template: check-lockfile-shared-models check-lockfile-mcp-common
 
 # Build container images
 .PHONY: build-all-images
-build-all-images: build-request-mgr-image build-agent-service-image build-integration-dispatcher-image build-mcp-snow-image build-mock-eventing-image build-mock-servicenow-image build-promptguard-image
+build-all-images: build-request-mgr-image build-agent-service-image build-integration-dispatcher-image build-mcp-snow-image build-mcp-zammad-image build-mock-eventing-image build-mock-servicenow-image build-promptguard-image build-zammad-bootstrap-image
 	@echo "All container images built successfully!"
 
 
@@ -618,6 +641,10 @@ build-promptguard-image: check-lockfile-promptguard check-deps-services-template
 build-mcp-snow-image: check-lockfile-mcp-snow check-deps-mcp-template
 	$(call build_template_image,$(MCP_SNOW_IMG),snow MCP image,Containerfile.mcp-template,mcp-servers/snow,snow.server,.)
 
+.PHONY: build-mcp-zammad-image
+build-mcp-zammad-image: check-lockfile-mcp-zammad check-deps-mcp-template
+	$(call build_template_image,$(MCP_ZAMMAD_IMG),Zammad MCP image,Containerfile.mcp-template,mcp-servers/zammad,zammad_mcp.server,.)
+
 .PHONY: build-mock-eventing-image
 build-mock-eventing-image: check-lockfile-mock-eventing check-deps-services-template
 	$(call build_template_image,$(MOCK_EVENTING_IMG),mock eventing service image,Containerfile.services-template,mock-eventing-service,mock_eventing_service.main,.)
@@ -626,9 +653,19 @@ build-mock-eventing-image: check-lockfile-mock-eventing check-deps-services-temp
 build-mock-servicenow-image: check-lockfile-mock-servicenow check-deps-services-template
 	$(call build_template_image,$(MOCK_SERVICENOW_IMG),mock ServiceNow server image,Containerfile.services-template,mock-service-now,mock_servicenow.server,.)
 
+.PHONY: build-zammad-bootstrap-image
+build-zammad-bootstrap-image: check-lockfile-zammad-bootstrap check-lockfile-mock-employee-data
+	@echo "Building Zammad bootstrap image: $(ZAMMAD_BOOTSTRAP_IMG)"
+	$(CONTAINER_TOOL) build -t $(ZAMMAD_BOOTSTRAP_IMG) --platform=$(ARCH) \
+		-f zammad-bootstrap/Containerfile.zammad-bootstrap \
+		--build-arg UV_VERSION=$(UV_VERSION) \
+		--build-arg USE_PIP_INSTALL=$(USE_PIP_INSTALL) \
+		.
+	@echo "Successfully built $(ZAMMAD_BOOTSTRAP_IMG)"
+
 # Push container images
 .PHONY: push-all-images
-push-all-images: push-request-mgr-image push-agent-service-image push-integration-dispatcher-image push-mcp-snow-image push-mock-eventing-image push-mock-servicenow-image push-promptguard-image
+push-all-images: push-request-mgr-image push-agent-service-image push-integration-dispatcher-image push-mcp-snow-image push-mcp-zammad-image push-mock-eventing-image push-mock-servicenow-image push-promptguard-image push-zammad-bootstrap-image
 	@echo "All container images pushed successfully!"
 
 
@@ -650,6 +687,10 @@ push-integration-dispatcher-image:
 push-mcp-snow-image:
 	$(call push_image,$(MCP_SNOW_IMG) $(PUSH_EXTRA_AGRS),snow MCP image)
 
+.PHONY: push-mcp-zammad-image
+push-mcp-zammad-image:
+	$(call push_image,$(MCP_ZAMMAD_IMG) $(PUSH_EXTRA_AGRS),Zammad MCP image)
+
 .PHONY: push-mock-eventing-image
 push-mock-eventing-image:
 	$(call push_image,$(MOCK_EVENTING_IMG) $(PUSH_EXTRA_AGRS),mock eventing service image)
@@ -658,13 +699,17 @@ push-mock-eventing-image:
 push-mock-servicenow-image:
 	$(call push_image,$(MOCK_SERVICENOW_IMG) $(PUSH_EXTRA_AGRS),mock ServiceNow server image)
 
+.PHONY: push-zammad-bootstrap-image
+push-zammad-bootstrap-image:
+	$(call push_image,$(ZAMMAD_BOOTSTRAP_IMG) $(PUSH_EXTRA_AGRS),Zammad bootstrap image)
+
 .PHONY: push-promptguard-image
 push-promptguard-image:
 	$(call push_image,$(PROMPTGUARD_IMG) $(PUSH_EXTRA_AGRS),PromptGuard service image)
 
 # Pull images at REGISTRY/VERSION with --platform=$(ARCH)
 .PHONY: pull-all-images
-pull-all-images: pull-request-mgr-image pull-agent-service-image pull-integration-dispatcher-image pull-mcp-snow-image pull-mock-eventing-image pull-mock-servicenow-image pull-promptguard-image
+pull-all-images: pull-request-mgr-image pull-agent-service-image pull-integration-dispatcher-image pull-mcp-snow-image pull-mcp-zammad-image pull-mock-eventing-image pull-mock-servicenow-image pull-promptguard-image pull-zammad-bootstrap-image
 	@echo "All images pulled successfully!"
 
 .PHONY: pull-request-mgr-image
@@ -683,6 +728,10 @@ pull-integration-dispatcher-image:
 pull-mcp-snow-image:
 	$(call pull_image,$(MCP_SNOW_IMG),snow MCP image)
 
+.PHONY: pull-mcp-zammad-image
+pull-mcp-zammad-image:
+	$(call pull_image,$(MCP_ZAMMAD_IMG),Zammad MCP image)
+
 .PHONY: pull-mock-eventing-image
 pull-mock-eventing-image:
 	$(call pull_image,$(MOCK_EVENTING_IMG),mock eventing service image)
@@ -691,13 +740,17 @@ pull-mock-eventing-image:
 pull-mock-servicenow-image:
 	$(call pull_image,$(MOCK_SERVICENOW_IMG),mock ServiceNow server image)
 
+.PHONY: pull-zammad-bootstrap-image
+pull-zammad-bootstrap-image:
+	$(call pull_image,$(ZAMMAD_BOOTSTRAP_IMG),Zammad bootstrap image)
+
 .PHONY: pull-promptguard-image
 pull-promptguard-image:
 	$(call pull_image,$(PROMPTGUARD_IMG),PromptGuard service image)
 
 # Retag images from REGISTRY/VERSION to NEW_REGISTRY/NEW_VERSION (both NEW_* must be set)
 .PHONY: retag-all-images
-retag-all-images: retag-request-mgr-image retag-agent-service-image retag-integration-dispatcher-image retag-mcp-snow-image retag-mock-eventing-image retag-mock-servicenow-image retag-promptguard-image
+retag-all-images: retag-request-mgr-image retag-agent-service-image retag-integration-dispatcher-image retag-mcp-snow-image retag-mcp-zammad-image retag-mock-eventing-image retag-mock-servicenow-image retag-promptguard-image retag-zammad-bootstrap-image
 	@echo "All images retagged to $(NEW_REGISTRY)/*:$(NEW_VERSION)"
 
 .PHONY: retag-request-mgr-image
@@ -716,6 +769,10 @@ retag-integration-dispatcher-image: pull-integration-dispatcher-image
 retag-mcp-snow-image: pull-mcp-snow-image
 	$(call retag_image,self-service-agent-snow-mcp,snow MCP image)
 
+.PHONY: retag-mcp-zammad-image
+retag-mcp-zammad-image: pull-mcp-zammad-image
+	$(call retag_image,self-service-agent-zammad-mcp,Zammad MCP image)
+
 .PHONY: retag-mock-eventing-image
 retag-mock-eventing-image: pull-mock-eventing-image
 	$(call retag_image,self-service-agent-mock-eventing,mock eventing service image)
@@ -723,6 +780,10 @@ retag-mock-eventing-image: pull-mock-eventing-image
 .PHONY: retag-mock-servicenow-image
 retag-mock-servicenow-image: pull-mock-servicenow-image
 	$(call retag_image,self-service-agent-mock-servicenow,mock ServiceNow server image)
+
+.PHONY: retag-zammad-bootstrap-image
+retag-zammad-bootstrap-image: pull-zammad-bootstrap-image
+	$(call retag_image,self-service-agent-zammad-bootstrap,Zammad bootstrap image)
 
 .PHONY: retag-promptguard-image
 retag-promptguard-image: pull-promptguard-image
@@ -752,7 +813,7 @@ check-logging:
 
 # Per-directory mypy linting (project-specific configurations)
 .PHONY: lint-mypy-per-directory
-lint-mypy-per-directory: lint-shared-models lint-shared-clients lint-agent-service lint-request-manager lint-integration-dispatcher lint-mcp-snow lint-mock-eventing lint-tracing-config lint-evaluations lint-servicenow-bootstrap lint-mock-employee-data lint-mock-servicenow
+lint-mypy-per-directory: lint-shared-models lint-shared-clients lint-agent-service lint-request-manager lint-integration-dispatcher lint-mcp-snow lint-mcp-zammad lint-mock-eventing lint-tracing-config lint-evaluations lint-servicenow-bootstrap lint-mock-employee-data lint-mock-servicenow
 	@echo "✅ All mypy linting completed"
 
 # Common function for mypy linting
@@ -789,6 +850,10 @@ lint-integration-dispatcher:
 .PHONY: lint-mcp-snow
 lint-mcp-snow:
 	$(call lint_mypy,mcp-servers/snow)
+
+.PHONY: lint-mcp-zammad
+lint-mcp-zammad:
+	$(call lint_mypy,mcp-servers/zammad)
 
 .PHONY: lint-mock-eventing
 lint-mock-eventing:
@@ -847,7 +912,7 @@ uninstall: helm-uninstall
 
 # Install dependencies (local dev)
 .PHONY: deps-all
-deps-all: deps-shared-models deps-shared-clients deps-tracing-config deps deps-request-manager deps-agent-service deps-integration-dispatcher deps-mcp-snow deps-mock-eventing deps-mock-employee-data deps-mock-servicenow deps-promptguard deps-evaluations deps-servicenow-bootstrap
+deps-all: deps-shared-models deps-shared-clients deps-tracing-config deps deps-request-manager deps-agent-service deps-integration-dispatcher deps-mcp-snow deps-mcp-zammad deps-mock-eventing deps-mock-employee-data deps-mock-servicenow deps-promptguard deps-evaluations deps-servicenow-bootstrap
 	@echo "All dependencies installed successfully!"
 
 .PHONY: deps-shared-models
@@ -876,7 +941,7 @@ reinstall:
 	@echo "All dependencies reinstalled with latest code!"
 
 .PHONY: reinstall-all
-reinstall-all: reinstall-shared-models reinstall-shared-clients reinstall reinstall-request-manager reinstall-agent-service reinstall-integration-dispatcher reinstall-mcp-snow reinstall-mock-employee-data reinstall-mock-servicenow reinstall-promptguard reinstall-servicenow-bootstrap
+reinstall-all: reinstall-shared-models reinstall-shared-clients reinstall reinstall-request-manager reinstall-agent-service reinstall-integration-dispatcher reinstall-mcp-snow reinstall-mcp-zammad reinstall-mock-employee-data reinstall-mock-servicenow reinstall-promptguard reinstall-servicenow-bootstrap
 	@echo "All project dependencies reinstalled successfully!"
 
 
@@ -903,6 +968,12 @@ reinstall-mcp-snow:
 	@echo "Force reinstalling snow MCP dependencies..."
 	cd mcp-servers/snow && uv sync --reinstall
 	@echo "Snow MCP dependencies reinstalled successfully!"
+
+.PHONY: reinstall-mcp-zammad
+reinstall-mcp-zammad:
+	@echo "Force reinstalling Zammad MCP dependencies..."
+	cd mcp-servers/zammad && uv sync --reinstall
+	@echo "Zammad MCP dependencies reinstalled successfully!"
 
 .PHONY: reinstall-shared-models
 reinstall-shared-models:
@@ -969,6 +1040,12 @@ deps-mcp-snow:
 	cd mcp-servers/snow && uv sync
 	@echo "Snow MCP dependencies installed successfully!"
 
+.PHONY: deps-mcp-zammad
+deps-mcp-zammad:
+	@echo "Installing Zammad MCP dependencies..."
+	cd mcp-servers/zammad && uv sync
+	@echo "Zammad MCP dependencies installed successfully!"
+
 .PHONY: deps-mock-eventing
 deps-mock-eventing:
 	@echo "Installing mock eventing service dependencies..."
@@ -1018,7 +1095,7 @@ deps-servicenow-bootstrap:
 
 # Test code
 .PHONY: test-all
-test-all: test-shared-models test-shared-clients test-request-manager test-agent-service test-integration-dispatcher test-mcp-snow test-servicenow-bootstrap test-mock-employee-data test-mock-servicenow
+test-all: test-shared-models test-shared-clients test-request-manager test-agent-service test-integration-dispatcher test-mcp-snow test-mcp-zammad test-servicenow-bootstrap test-mock-employee-data test-mock-servicenow
 	@echo "All tests completed successfully!"
 
 # Lockfile management
@@ -1026,7 +1103,7 @@ test-all: test-shared-models test-shared-clients test-request-manager test-agent
 MAKE_SAME := $(MAKE) -f $(firstword $(MAKEFILE_LIST))
 # All directories that have uv.lock (for check-lockfiles and update-lockfiles).
 # Export of requirements.txt only runs for dirs also in REQUIREMENTS_DIRS (see update_lockfile).
-LOCKFILE_DIRS := shared-models shared-clients agent-service request-manager integration-dispatcher mcp-servers/snow mock-eventing-service mock-employee-data promptguard-service scripts/servicenow-bootstrap
+LOCKFILE_DIRS := shared-models shared-clients agent-service request-manager integration-dispatcher mcp-servers/mcp-common mcp-servers/snow mcp-servers/zammad mock-eventing-service mock-employee-data promptguard-service scripts/servicenow-bootstrap zammad-bootstrap
 
 define check_lockfile
 	@echo "📦 Checking $(1)..."
@@ -1098,7 +1175,7 @@ update-lockfiles: check-uv-version
 	@echo "🎉 All lockfiles updated successfully!"
 
 # Individual service lockfile targets
-.PHONY: check-lockfile-root check-lockfile-shared-models check-lockfile-shared-clients check-lockfile-agent-service check-lockfile-request-manager check-lockfile-integration-dispatcher check-lockfile-mcp-snow check-lockfile-mock-eventing check-lockfile-mock-employee-data check-lockfile-mock-servicenow check-lockfile-promptguard check-lockfile-servicenow-bootstrap
+.PHONY: check-lockfile-root check-lockfile-shared-models check-lockfile-shared-clients check-lockfile-agent-service check-lockfile-request-manager check-lockfile-integration-dispatcher check-lockfile-mcp-common check-lockfile-mcp-snow check-lockfile-mcp-zammad check-lockfile-mock-eventing check-lockfile-mock-employee-data check-lockfile-mock-servicenow check-lockfile-promptguard check-lockfile-servicenow-bootstrap check-lockfile-zammad-bootstrap
 check-lockfile-root:
 	@echo "📦 Checking root project..."
 	@if uv lock --check; then \
@@ -1122,8 +1199,14 @@ check-lockfile-request-manager:
 check-lockfile-integration-dispatcher:
 	$(call check_lockfile,integration-dispatcher)
 
+check-lockfile-mcp-common:
+	$(call check_lockfile,mcp-servers/mcp-common)
+
 check-lockfile-mcp-snow:
 	$(call check_lockfile,mcp-servers/snow)
+
+check-lockfile-mcp-zammad:
+	$(call check_lockfile,mcp-servers/zammad)
 
 check-lockfile-mock-eventing:
 	$(call check_lockfile,mock-eventing-service)
@@ -1140,8 +1223,11 @@ check-lockfile-promptguard:
 check-lockfile-servicenow-bootstrap:
 	$(call check_lockfile,scripts/servicenow-bootstrap)
 
+check-lockfile-zammad-bootstrap:
+	$(call check_lockfile,zammad-bootstrap)
 
-.PHONY: update-lockfile-shared-models update-lockfile-shared-clients update-lockfile-agent-service update-lockfile-request-manager update-lockfile-integration-dispatcher update-lockfile-mcp-snow update-lockfile-mock-eventing update-lockfile-mock-employee-data update-lockfile-mock-servicenow update-lockfile-promptguard update-lockfile-servicenow-bootstrap
+
+.PHONY: update-lockfile-shared-models update-lockfile-shared-clients update-lockfile-agent-service update-lockfile-request-manager update-lockfile-integration-dispatcher update-lockfile-mcp-common update-lockfile-mcp-snow update-lockfile-mcp-zammad update-lockfile-mock-eventing update-lockfile-mock-employee-data update-lockfile-mock-servicenow update-lockfile-promptguard update-lockfile-servicenow-bootstrap update-lockfile-zammad-bootstrap
 update-lockfile-shared-models:
 	$(call update_lockfile,shared-models)
 
@@ -1157,8 +1243,14 @@ update-lockfile-request-manager:
 update-lockfile-integration-dispatcher:
 	$(call update_lockfile,integration-dispatcher)
 
+update-lockfile-mcp-common:
+	$(call update_lockfile,mcp-servers/mcp-common)
+
 update-lockfile-mcp-snow:
 	$(call update_lockfile,mcp-servers/snow)
+
+update-lockfile-mcp-zammad:
+	$(call update_lockfile,mcp-servers/zammad)
 
 update-lockfile-mock-eventing:
 	$(call update_lockfile,mock-eventing-service)
@@ -1174,6 +1266,9 @@ update-lockfile-promptguard:
 
 update-lockfile-servicenow-bootstrap:
 	$(call update_lockfile,scripts/servicenow-bootstrap)
+
+update-lockfile-zammad-bootstrap:
+	$(call update_lockfile,zammad-bootstrap)
 
 # Full export for one directory: check, cd, uv export, add_torch_hash, echo. Single line so Make does not echo the recipe.
 # Usage: $(call export_requirements,dir) or: $(MAKE) _export-one-dir DIR=<dir>
@@ -1197,7 +1292,7 @@ _export-one-dir:
 # CI uses: astral-sh/setup-uv@v5 with version: "0.8.9"
 # To install locally: curl -LsSf https://astral.sh/uv/0.8.9/install.sh | sh
 # Or update: uv self update (may install newer version - check with make check-uv-version)
-REQUIREMENTS_DIRS := agent-service integration-dispatcher promptguard-service request-manager mock-eventing-service mock-service-now mcp-servers/snow shared-models shared-clients mock-employee-data
+REQUIREMENTS_DIRS := agent-service integration-dispatcher promptguard-service request-manager mock-eventing-service mock-service-now mcp-servers/snow mcp-servers/zammad shared-models shared-clients mock-employee-data zammad-bootstrap
 # UV_VERSION: uv version for CI validation and container builds (default: 0.8.9, can be overridden)
 UV_VERSION ?= 0.8.9
 EXTRACT_TORCH_HASH_SCRIPT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))scripts/extract_torch_hash.py)
@@ -1237,6 +1332,11 @@ export-requirements: check-uv-version
 		echo; \
 	done
 	@echo "🎉 All requirements.txt files exported successfully!"
+
+.PHONY: check-release-manifest
+check-release-manifest:
+	@echo "🔍 Checking Makefile BASE_VERSION matches scripts/bump-release.manifest.json..."
+	@python3 scripts/bump_release.py --verify
 
 .PHONY: check-requirements
 check-requirements: check-uv-version
@@ -1314,6 +1414,10 @@ test-integration-dispatcher:
 test-mcp-snow:
 	$(call run_pytest,snow MCP,mcp-servers/snow)
 
+.PHONY: test-mcp-zammad
+test-mcp-zammad:
+	$(call run_pytest,zammad MCP,mcp-servers/zammad)
+
 .PHONY: test-servicenow-bootstrap
 test-servicenow-bootstrap:
 	$(call run_pytest,ServiceNow automation,scripts/servicenow-bootstrap)
@@ -1341,7 +1445,7 @@ check-known-bad-conversations: sync-evaluations
 .PHONY: test-short-ticket-laptop-refresh
 test-short-ticket-laptop-refresh:
 	@echo "Running short responses integration test for ticket-laptop-refresh flow..."
-	uv --directory evaluations run evaluate.py -n 1 --test-script chat-responses-request-mgr.py --reset-conversation --flow ticket_laptop_refresh $(VALIDATE_LAPTOP_DETAILS_FLAG) $(STRUCTURED_OUTPUT_FLAG)
+	uv --directory evaluations run evaluate.py --message-timeout 1800 --timeout=1800 -n 1 --flow ticket_laptop_refresh,ticket_unrelated $(VALIDATE_LAPTOP_DETAILS_FLAG) $(STRUCTURED_OUTPUT_FLAG)
 	@echo "short responses integration test for ticket-laptop-refresh flow completed successfully!"
 
 .PHONY: test-short-resp-integration-request-mgr
@@ -1425,6 +1529,15 @@ namespace:
 .PHONY: helm-depend
 helm-depend:
 	@needs_update=; \
+	for pair in $$(awk '/^- name:/{n=$$3} /^  version:/{if(n){v=$$2; gsub(/"/,"",v); print n"-"v".tgz"; n=""}}' helm/zammad/Chart.lock 2>/dev/null); do \
+		if [ ! -f "helm/zammad/charts/$$pair" ]; then \
+			echo "Updating Zammad sub-chart dependencies"; \
+			(cd helm/zammad && helm dependency update); \
+			needs_update=1; \
+			break; \
+		fi; \
+	done; \
+	if grep -q 'file://' helm/Chart.lock 2>/dev/null; then needs_update=1; fi; \
 	for pair in $$(awk '/^- name:/{n=$$3} /^  version:/{if(n){v=$$2; gsub(/"/,"",v); print n"-"v".tgz"; n=""}}' helm/Chart.lock 2>/dev/null); do \
 		if [ ! -f "helm/charts/$$pair" ]; then needs_update=1; break; fi; \
 	done; \
@@ -1460,8 +1573,7 @@ define helm_install_common
 		-n $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 
 	@echo "Cleaning up any existing jobs..."
-	@kubectl delete job -l app.kubernetes.io/component=init -n $(NAMESPACE) --ignore-not-found || true
-	@kubectl delete job -l app.kubernetes.io/name=self-service-agent -n $(NAMESPACE) --ignore-not-found || true
+	@kubectl delete job -l app.kubernetes.io/instance=$(MAIN_CHART_NAME) -n $(NAMESPACE) --ignore-not-found || true
 	@echo "Installing $(MAIN_CHART_NAME) helm chart $(1)"
 	@if [ -n "$(GIT_BRANCH)" ] && [ "$(origin VERSION)" = "undefined" ]; then \
 		echo "Using image version: $(VERSION) (auto-detected from branch: $(GIT_BRANCH))"; \
@@ -1493,6 +1605,7 @@ define helm_install_common
 		$(TEST_USERS_ARGS) \
 		$(LANGFUSE_ARGS) \
 		$(FAULT_INJECTION_ARGS) \
+		$(DEFAULT_AGENT_ID_ARG) \
 		$(if $(filter-out "",$(2)),$(2),) \
 		$(EXTRA_HELM_ARGS)
 	@echo "Waiting for deployments to be ready..."
@@ -1550,6 +1663,7 @@ define helm_export
 		$(helm_test_users_args) \
 		$(if $(filter true,$(ENABLE_LANGFUSE)),--set langfuse.enabled=true,) \
 		$(helm_fault_injection_args) \
+		$(DEFAULT_AGENT_ID_ARG) \
 		$(if $(filter-out "",$(1)),$(1),) \
 		$(EXTRA_HELM_ARGS)
 	@echo "Helm export complete."
@@ -1558,6 +1672,7 @@ endef
 # Install with mock eventing service (testing/development/CI mode - default)
 # Extract all LG_PROMPT_* variables and convert them to Helm --set arguments
 PROMPT_OVERRIDES := $(foreach var,$(filter LG_PROMPT_%,$(.VARIABLES)),--set requestManagement.agentService.promptOverrides.lg-prompt-$(shell echo $(var:LG_PROMPT_%=%) | tr '[:upper:]' '[:lower:]' | tr '_' '-')=$($(var)))
+DEFAULT_AGENT_ID_ARG := $(if $(DEFAULT_AGENT_ID),--set agent.defaultAgentId=$(DEFAULT_AGENT_ID),)
 
 .PHONY: helm-install-test
 helm-install-test: namespace helm-depend
@@ -1581,78 +1696,92 @@ helm-install-demo: namespace helm-depend deploy-email-server
 	@$(MAKE) print-urls
 
 # Install with ticketing channel (Zammad + MCP).
-# Order: install our chart first (creates Route), deploy Zammad with FQDN from Route, then bootstrap token.
-# Zammad gets correct FQDN at deploy (passed from Route host).
+# Main chart and Zammad are installed in parallel; FQDN is pre-computed before either starts.
+# Token creation runs after both are ready.
+# Install with ticketing channel: Zammad deployed as a subchart of the main chart.
+# Bootstrap Job (post-install hook) seeds users, creates MCP agent token, patches secret,
+# and restarts dependent deployments — no separate token step required.
 .PHONY: helm-install-ticketing
 helm-install-ticketing: namespace helm-depend
-	@echo "Step 1/4: Creating placeholder secret and installing our chart (creates Route)..."
-	@ZAMMAD_URL="http://zammad-nginx.$(NAMESPACE).svc.cluster.local:8080"; \
-	kubectl create secret generic $(ZAMMAD_CREDENTIALS_SECRET) \
-		--from-literal=zammad-url="$$ZAMMAD_URL/api/v1" \
+	@echo "Step 1/3: Creating additional knowledge base ConfigMaps..."
+	@kubectl create configmap kb-general-support \
+		--from-file=./additional-knowledge-bases/general-support/ \
+		-n $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+	@echo "Step 2/3: Installing main chart with Zammad subchart..."
+	@# Create initial credentials secret with empty token so main chart resources can start.
+	@kubectl create secret generic $(ZAMMAD_CREDENTIALS_SECRET) \
+		--from-literal=zammad-url="$(ZAMMAD_URL)" \
+		--from-literal=zammad-api-url="$(ZAMMAD_URL)/api/v1" \
 		--from-literal=zammad-http-token="" \
-		-n $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -; \
-	$(MAKE) _helm-install-ticketing-single ZAMMAD_URL="$$ZAMMAD_URL"
-	@echo "Step 2/4: Getting Route host and deploying Zammad with FQDN..."
-	@ZAMMAD_ROUTE=$$(oc get route ssa-zammad -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null); \
-	if [ -z "$$ZAMMAD_ROUTE" ]; then ZAMMAD_ROUTE=$$(oc get route -n $(NAMESPACE) -l app.kubernetes.io/component=zammad -o jsonpath='{.items[0].spec.host}' 2>/dev/null); fi; \
-	if [ -z "$$ZAMMAD_ROUTE" ]; then ZAMMAD_ROUTE=$$(oc get route -n $(NAMESPACE) -l app.kubernetes.io/instance=zammad -o jsonpath='{.items[0].spec.host}' 2>/dev/null); fi; \
-		if [ -n "$$ZAMMAD_ROUTE" ]; then \
-		echo "Route host: $$ZAMMAD_ROUTE (passing as ZAMMAD_FQDN)"; \
-		$(MAKE) _zammad-patch-embed-configmap NAMESPACE=$(NAMESPACE) ZAMMAD_ROUTE="$$ZAMMAD_ROUTE"; \
-		$(MAKE) deploy-zammad NAMESPACE=$(NAMESPACE) ZAMMAD_FQDN="$$ZAMMAD_ROUTE"; \
-	else \
-		echo "No Route found; deploying Zammad without FQDN (port-forward will work)"; \
-		$(MAKE) deploy-zammad NAMESPACE=$(NAMESPACE); \
-	fi
-	@echo "Step 3/4: Triggering autoWizard and creating API token..."
-	@$(MAKE) zammad-trigger-autowizard NAMESPACE=$(NAMESPACE) 2>/dev/null || true; \
-	ZAMMAD_URL="http://zammad-nginx.$(NAMESPACE).svc.cluster.local:8080"; \
-	ZAMMAD_TOKEN=$$(kubectl get secret $(ZAMMAD_CREDENTIALS_SECRET) -n $(NAMESPACE) -o jsonpath='{.data.zammad-http-token}' 2>/dev/null | base64 -d 2>/dev/null || true); \
-	if [ -z "$$ZAMMAD_TOKEN" ]; then \
-		echo "Creating Zammad API token via exec..."; \
-		ZAMMAD_TOKEN=$$(kubectl exec deploy/zammad-railsserver -n $(NAMESPACE) -- env ZAMMAD_ADMIN_EMAIL='$(ZAMMAD_ADMIN_EMAIL)' ZAMMAD_ADMIN_PASSWORD='$(ZAMMAD_ADMIN_PASSWORD)' ruby -rnet/http -rjson -e 'uri=URI("http://localhost:3000/api/v1/user_access_token");req=Net::HTTP::Post.new(uri);req.basic_auth(ENV["ZAMMAD_ADMIN_EMAIL"],ENV["ZAMMAD_ADMIN_PASSWORD"]);req["Content-Type"]="application/json";req.body=JSON.generate({"name"=>"mcp-agent","permission"=>["admin","ticket.agent"]});res=Net::HTTP.start(uri.hostname,uri.port){|h|h.request(req)};d=JSON.parse(res.body);t=d["token"];t ? puts(t) : ($$stderr.puts("Zammad API #{res.code}: #{res.body[0,500]}");exit 1)' ) || ZAMMAD_TOKEN=""; \
+		-n $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+	@# Compute cluster-specific values (OpenShift UID, FQDN) and write temp overlay file.
+	@ZAMMAD_UID=$$(kubectl get namespace $(NAMESPACE) -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.uid-range}' 2>/dev/null | cut -d'/' -f1); \
+	ZAMMAD_FQDN="$(ZAMMAD_FQDN)"; \
+	if [ -z "$$ZAMMAD_FQDN" ]; then \
+		APPS_DOMAIN=$$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null); \
+		if [ -n "$$APPS_DOMAIN" ]; then \
+			ZAMMAD_FQDN="ssa-zammad-$(NAMESPACE).$$APPS_DOMAIN"; \
+			echo "Pre-computed Zammad FQDN: $$ZAMMAD_FQDN"; \
+		fi; \
 	fi; \
-	if [ -n "$$ZAMMAD_TOKEN" ]; then \
-		echo "✅ Token created"; \
-		kubectl create secret generic $(ZAMMAD_CREDENTIALS_SECRET) \
-			--from-literal=zammad-url="$$ZAMMAD_URL/api/v1" \
-			--from-literal=zammad-http-token="$$ZAMMAD_TOKEN" \
-			-n $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -; \
-		echo "Restarting Zammad MCP..."; \
-		kubectl rollout restart deployment/mcp-zammad-mcp -n $(NAMESPACE) 2>/dev/null || true; \
-		kubectl rollout status deployment/mcp-zammad-mcp -n $(NAMESPACE) --timeout=2m 2>/dev/null || true; \
-	else \
-		echo "⚠ Token creation failed (run make zammad-bootstrap-token NAMESPACE=$(NAMESPACE) after completing autoWizard)"; \
-	fi
-	@echo "Step 4/4: Printing checklist..."
-	@$(MAKE) _helm-install-ticketing-print-checklist NAMESPACE=$(NAMESPACE)
-
-.PHONY: _helm-install-ticketing-single
-_helm-install-ticketing-single:
-	@$(call helm_install_common,with ticketing config - Zammad MCP,\
+	[ -n "$$ZAMMAD_UID" ] && echo "OpenShift: using namespace UID $$ZAMMAD_UID for restricted SCC" || true; \
+	{ \
+		printf 'ticketingZammad:\n'; \
+		printf '  bootstrap:\n'; \
+		printf '    imageRegistry: "%s"\n' '$(REGISTRY)'; \
+		printf '    imageRepository: "%s"\n' 'self-service-agent-zammad-bootstrap'; \
+		printf '    imageTag: "%s"\n' '$(VERSION)'; \
+		printf '    integrationWebhook:\n'; \
+		printf '      mainChartReleaseName: "%s"\n' '$(MAIN_CHART_NAME)'; \
+		if [ -n "$$ZAMMAD_UID" ] || [ -n "$$ZAMMAD_FQDN" ]; then \
+			printf '  zammad:\n'; \
+			if [ -n "$$ZAMMAD_UID" ]; then \
+				printf '    securityContext:\n'; \
+				printf '      runAsUser: %s\n' "$$ZAMMAD_UID"; \
+				printf '      runAsGroup: %s\n' "$$ZAMMAD_UID"; \
+				printf '      fsGroup: %s\n' "$$ZAMMAD_UID"; \
+			fi; \
+			if [ -n "$$ZAMMAD_FQDN" ]; then \
+				printf '    extraEnv:\n'; \
+				printf '    - name: ZAMMAD_FQDN\n'; \
+				printf '      value: "%s"\n' "$$ZAMMAD_FQDN"; \
+				printf '    - name: ZAMMAD_HTTP_TYPE\n'; \
+				printf '      value: https\n'; \
+			fi; \
+		fi; \
+	} > $(ZAMMAD_TICKETING_OVERLAY)
+	@$(call helm_install_common,with ticketing channel (Zammad subchart),\
 		-f helm/values-test.yaml \
 		-f helm/values-ticketing.yaml \
-		--set zammad.url=$(ZAMMAD_URL) \
+		-f $(ZAMMAD_TICKETING_OVERLAY) \
+		--timeout 25m \
 		--set mcp-servers.mcp-servers.zammad-mcp.enabled=true \
-		--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_URL.name=$(ZAMMAD_CREDENTIALS_SECRET) \
-		--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_URL.key=zammad-url \
-		--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_HTTP_TOKEN.name=$(ZAMMAD_CREDENTIALS_SECRET) \
-		--set mcp-servers.mcp-servers.zammad-mcp.envSecrets.ZAMMAD_HTTP_TOKEN.key=zammad-http-token \
+		$(helm_ticketing_args) \
 		$(PROMPT_OVERRIDES),\
 		true)
+	@rm -f $(ZAMMAD_TICKETING_OVERLAY)
+	@echo "Waiting for Zammad deployments to be ready..."
+	@for dep in zammad-nginx zammad-railsserver zammad-websocket zammad-scheduler mcp-zammad-mcp; do \
+		echo "  Waiting for $$dep..."; \
+		kubectl rollout status deploy/$$dep -n $(NAMESPACE) --timeout=10m; \
+	done
+	@if [ "$(ZAMMAD_DEMO_SITE_ENABLED)" = "true" ]; then \
+		echo "Installing same-host Zammad demo site (Helm release zammad-demo-site)..."; \
+		ZAMMAD_FQDN="$(ZAMMAD_FQDN)"; \
+		if [ -z "$$ZAMMAD_FQDN" ]; then \
+			APPS_DOMAIN=$$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null); \
+			[ -n "$$APPS_DOMAIN" ] && ZAMMAD_FQDN="ssa-zammad-$(NAMESPACE).$$APPS_DOMAIN"; \
+		fi; \
+		DEMO_SITE_HELM_ARGS="--set enabled=true"; \
+		[ -n "$$ZAMMAD_FQDN" ] && DEMO_SITE_HELM_ARGS="$$DEMO_SITE_HELM_ARGS --set publicUrl=https://$$ZAMMAD_FQDN"; \
+		DEMO_SITE_HELM_ARGS="$$DEMO_SITE_HELM_ARGS --set pathPrefix=/$(ZAMMAD_DEMO_SITE_PATH)"; \
+		helm upgrade --install zammad-demo-site helm/zammad-demo-site/ -n $(NAMESPACE) $$DEMO_SITE_HELM_ARGS; \
+	else \
+		helm uninstall zammad-demo-site -n $(NAMESPACE) --ignore-not-found 2>/dev/null || true; \
+	fi
 	@$(MAKE) print-urls
-
-# Patch embed ConfigMap with Zammad URL and restart deployment (no helm upgrade)
-.PHONY: _zammad-patch-embed-configmap
-_zammad-patch-embed-configmap: namespace
-	@ZAMMAD_URL="https://$(ZAMMAD_ROUTE)"; \
-	sed "s|__ZAMMAD_URL__|$$ZAMMAD_URL|g" helm/static/zammad-embed-index.html.template > /tmp/zammad-embed-index.$$$$.html; \
-	kubectl create configmap $(MAIN_CHART_NAME)-zammad-embed \
-		--from-file=index.html=/tmp/zammad-embed-index.$$$$.html \
-		-n $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -; \
-	rm -f /tmp/zammad-embed-index.$$$$.html; \
-	kubectl rollout restart deployment/$(MAIN_CHART_NAME)-zammad-embed -n $(NAMESPACE) 2>/dev/null || true; \
-	echo "Embed ConfigMap updated with $$ZAMMAD_URL"
+	@echo "Step 3/3: Printing checklist..."
+	@$(MAKE) _helm-install-ticketing-print-checklist NAMESPACE=$(NAMESPACE)
 
 .PHONY: _helm-install-ticketing-print-checklist
 _helm-install-ticketing-print-checklist:
@@ -1661,33 +1790,40 @@ _helm-install-ticketing-print-checklist:
 	@echo "🎫 Ticketing Channel - Follow-up Steps"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo ""
-	@echo "  1. Get the Zammad URL (Route or port-forward):"
+	@echo "  1. Zammad URLs:"
 	@ZAMMAD_ROUTE=$$(oc get route ssa-zammad -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null); \
-	ZAMMAD_EMBED_ROUTE=$$(oc get route ssa-zammad-embed -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null); \
+	ZAMMAD_DEMO_SITE_INSTALLED=$$(oc get route ssa-zammad-demo-site -n $(NAMESPACE) -o name 2>/dev/null); \
 	if [ -z "$$ZAMMAD_ROUTE" ]; then ZAMMAD_ROUTE=$$(oc get route -n $(NAMESPACE) -l app.kubernetes.io/instance=zammad -o jsonpath='{.items[0].spec.host}' 2>/dev/null); fi; \
 	if [ -n "$$ZAMMAD_ROUTE" ]; then \
 		echo "     Web UI: https://$$ZAMMAD_ROUTE"; \
 		echo "     API:    https://$$ZAMMAD_ROUTE/api/v1"; \
-		if [ -n "$$ZAMMAD_EMBED_ROUTE" ]; then echo "     Embed:  https://$$ZAMMAD_EMBED_ROUTE (Zammad chat widget — embed snippet + live preview)"; fi; \
+		if [ -n "$$ZAMMAD_DEMO_SITE_INSTALLED" ]; then \
+			echo "     Demo site (same host): https://$$ZAMMAD_ROUTE/$(ZAMMAD_DEMO_SITE_PATH)/ — chat snippet page: /$(ZAMMAD_DEMO_SITE_PATH)/chat-snippet.html (widget needs agents online for chat; Admin → Channels → Chat)."; \
+		else \
+			echo "     Demo site: not installed — ZAMMAD_DEMO_SITE_ENABLED was not true. Re-run with ZAMMAD_DEMO_SITE_ENABLED=true (default) or omit it."; \
+		fi; \
 	else \
 		echo "     Port-forward: kubectl port-forward -n $(NAMESPACE) svc/zammad-nginx 8080:8080"; \
 		echo "     Web UI: http://localhost:8080"; \
 		echo "     API:    http://localhost:8080/api/v1"; \
+	fi; \
+	echo ""; \
+	if [ -n "$$ZAMMAD_DEMO_SITE_INSTALLED" ]; then \
+		echo "  2. Demo site: login at /$(ZAMMAD_DEMO_SITE_PATH)/; chat widget snippet + preview at /$(ZAMMAD_DEMO_SITE_PATH)/chat-snippet.html on the Web UI host. Admin → Channels → Chat (agents must be available for the widget)."; \
+		echo "     Full chat → agent reply loop needs integration-dispatcher + webhook/MCP when enabled."; \
+		echo ""; \
 	fi
+	@echo "  3. Zammad FQDN: pre-computed / Makefile overlay when needed so the Route and HTTPS behave correctly."
 	@echo ""
-	@echo "  2. Zammad FQDN: configured at deploy (from Route host) so Route loads correctly"
+	@echo "  4. If the MCP token was not written by the bootstrap Job:"
+	@echo "     - kubectl logs -n $(NAMESPACE) job/$(MAIN_CHART_NAME)-bootstrap"
+	@echo "       (or: kubectl logs -n $(NAMESPACE) -l app.kubernetes.io/component=zammad-bootstrap)"
+	@echo "     - Ensure ticketingZammad.bootstrap.createToken and credentialsSecret match your cluster."
 	@echo ""
-	@echo "  3. If token was not auto-created:"
-	@echo "     - make zammad-bootstrap-token NAMESPACE=$(NAMESPACE)"
-	@echo "     - Or create token in Zammad UI, then: make zammad-set-token NAMESPACE=$(NAMESPACE) ZAMMAD_TOKEN=<token>"
+	@echo "  5. Webhook: ticketing defaults enable ticketingZammad.bootstrap.integrationWebhook; the post-install bootstrap Job creates the Webhook + Trigger → integration-dispatcher (README.md § Integration with Zammad ticketing). Set ticketingZammad.webhookSecret so $(MAIN_CHART_NAME)-integration-secrets includes zammad-webhook-secret for HMAC verification."
 	@echo ""
-	@echo "  4. Chat widget: Admin → Channels → Chat (agents must be available)."
-	@echo "     Full chat → agent reply loop needs app integration (webhook/MCP/agent) when enabled."
-	@echo ""
-	@echo "  5. (Optional) Webhook trigger for Zammad → blueprint (when that integration is merged)."
-	@echo "     If embed page shows YOUR-ZAMMAD-URL: make zammad-update-embed-url NAMESPACE=$(NAMESPACE)"
-	@echo ""
-	@echo "  Admin login defaults: ZAMMAD_ADMIN_EMAIL / ZAMMAD_ADMIN_PASSWORD (see Makefile; must match autoWizard in helm/values-zammad-deploy.yaml)."
+	@echo "  Admin login defaults: ZAMMAD_ADMIN_EMAIL / ZAMMAD_ADMIN_PASSWORD (see Makefile; must match autoWizard in helm/values-ticketing.yaml)."
+	@echo "  Optional: TEST_USERS (comma-separated emails) on helm-install-ticketing → bootstrap Job provisions mock-employee-data customers in Zammad."
 	@echo "  More: README.md, docs/HELM_EXPORT_ANSIBLE.md"
 	@echo ""
 
@@ -1881,7 +2017,10 @@ helm-uninstall:
 	@echo "Step 4: Final cleanup of namespace $(NAMESPACE)..."
 	@$(MAKE) helm-cleanup-jobs
 	@$(MAKE) undeploy-email-server
-	@$(MAKE) undeploy-zammad
+	@helm uninstall zammad-demo-site -n $(NAMESPACE) --ignore-not-found 2>/dev/null || true
+	@kubectl delete jobs -n $(NAMESPACE) -l app.kubernetes.io/component=zammad-bootstrap --ignore-not-found --wait=false 2>/dev/null || true
+	@sleep 5
+	@for pvc in $$(kubectl get pvc -n $(NAMESPACE) -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E '^data-(zammad|$(MAIN_CHART_NAME))-(elasticsearch|postgresql|redis|memcached)' || true); do kubectl delete pvc $$pvc -n $(NAMESPACE) --ignore-not-found; done
 	@echo "Removing ServiceNow credentials secret from $(NAMESPACE)"
 	@kubectl delete secret $(MAIN_CHART_NAME)-servicenow-credentials -n $(NAMESPACE) --ignore-not-found || true
 	@echo "Removing Zammad credentials secret from $(NAMESPACE)"
@@ -1921,6 +2060,8 @@ helm-cleanup-eventing:
 helm-cleanup-jobs:
 	@echo "Cleaning up leftover jobs in namespace $(NAMESPACE)..."
 	@kubectl delete jobs -n $(NAMESPACE) -l app.kubernetes.io/name=self-service-agent --ignore-not-found || true
+	@echo "Removing Zammad wrapper bootstrap Job(s) if still present..."
+	@kubectl delete jobs -n $(NAMESPACE) -l app.kubernetes.io/component=zammad-bootstrap --ignore-not-found --wait=false 2>/dev/null || true
 	@echo "Job cleanup completed for namespace $(NAMESPACE)"
 
 # Check deployment status
@@ -2059,166 +2200,8 @@ undeploy-email-server:
 	@kubectl delete -f test-email-server/test-email-server-greenmail.yaml -n $(NAMESPACE) --ignore-not-found 2>/dev/null || true
 	@echo "✅ Test email server removed successfully!"
 
-# Zammad deployment (prerequisite for ticketing channel)
-ZAMMAD_HELM_REPO ?= https://zammad.github.io/zammad-helm
-ZAMMAD_CHART_VERSION ?= 16.0.4
-
-# ZAMMAD_FQDN: when set (e.g. from Route host), passed as extraEnv so Zammad accepts Route requests.
-# Used by helm-install-ticketing which installs our chart first (creates Route), then deploys Zammad.
-.PHONY: deploy-zammad
-deploy-zammad: namespace
-	@echo "Deploying Zammad instance to namespace $(NAMESPACE)..."
-	@echo "This may take 10-15 minutes (Zammad brings elasticsearch, postgresql, redis, memcached)..."
-	@helm repo add zammad $(ZAMMAD_HELM_REPO) 2>/dev/null || helm repo add zammad $(ZAMMAD_HELM_REPO) --force-update
-	@helm repo update zammad
-	@ZAMMAD_UID=$$(kubectl get namespace $(NAMESPACE) -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.uid-range}' 2>/dev/null | cut -d'/' -f1); \
-	ZAMMAD_ARGS="-f helm/values-zammad-deploy.yaml"; \
-	if [ -n "$$ZAMMAD_UID" ]; then \
-		ZAMMAD_ARGS="$$ZAMMAD_ARGS --set securityContext.runAsUser=$$ZAMMAD_UID --set securityContext.runAsGroup=$$ZAMMAD_UID --set securityContext.fsGroup=$$ZAMMAD_UID"; \
-		echo "OpenShift: using namespace UID $$ZAMMAD_UID for restricted SCC"; \
-	fi; \
-	if [ -n "$(ZAMMAD_FQDN)" ]; then \
-		echo "Configuring Zammad FQDN for Route: $(ZAMMAD_FQDN)"; \
-		TMPFQDN=$$(mktemp); \
-		echo "extraEnv:" > $$TMPFQDN; \
-		echo "  - name: ZAMMAD_FQDN" >> $$TMPFQDN; \
-		echo "    value: \"$(ZAMMAD_FQDN)\"" >> $$TMPFQDN; \
-		echo "  - name: ZAMMAD_HTTP_TYPE" >> $$TMPFQDN; \
-		echo "    value: \"https\"" >> $$TMPFQDN; \
-		ZAMMAD_ARGS="$$ZAMMAD_ARGS -f $$TMPFQDN"; \
-	fi; \
-	helm upgrade --install zammad zammad/zammad \
-		--version $(ZAMMAD_CHART_VERSION) \
-		-n $(NAMESPACE) \
-		$$ZAMMAD_ARGS \
-		--timeout 20m \
-		--wait; \
-	if [ -n "$(ZAMMAD_FQDN)" ] && [ -n "$$TMPFQDN" ]; then rm -f $$TMPFQDN; fi
-	@echo ""
-	@echo "✅ Zammad instance deployed successfully!"
-	@echo ""
-	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo "🎫 Zammad Ticketing Instance"
-	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo ""
-	@echo "📋 Next steps:"
-	@ZAMMAD_ROUTE=$$(oc get route ssa-zammad -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null); \
-	if [ -z "$$ZAMMAD_ROUTE" ]; then ZAMMAD_ROUTE=$$(oc get route -n $(NAMESPACE) -l app.kubernetes.io/instance=zammad -o jsonpath='{.items[0].spec.host}' 2>/dev/null); fi; \
-	echo "  1. Zammad URLs (Route or port-forward):"; \
-	if [ -n "$$ZAMMAD_ROUTE" ]; then \
-		echo "     Web UI: https://$$ZAMMAD_ROUTE"; \
-		echo "     API:    https://$$ZAMMAD_ROUTE/api/v1"; \
-		AUTO_WIZ_URL="https://$$ZAMMAD_ROUTE/#getting_started/auto_wizard/$(ZAMMAD_AUTOWIZARD_TOKEN)"; \
-	else \
-		echo "     Port-forward: kubectl port-forward -n $(NAMESPACE) svc/zammad-nginx 8080:8080"; \
-		echo "     Web UI / API: http://localhost:8080 (and /api/v1)"; \
-		AUTO_WIZ_URL="http://localhost:8080/#getting_started/auto_wizard/$(ZAMMAD_AUTOWIZARD_TOKEN)"; \
-	fi; \
-	echo ""; \
-	echo "  2. Admin login (autoWizard seed; must match helm/values-zammad-deploy.yaml unless you overrode it):"; \
-	echo "       Email:    $(ZAMMAD_ADMIN_EMAIL)"; \
-	echo "       Password: same as Users[0].password in helm/values-zammad-deploy.yaml (Makefile: ZAMMAD_ADMIN_PASSWORD; not printed—override on make targets if you customized autoWizard)"; \
-	echo ""; \
-	echo "  3. Finish autoWizard if needed (or run make zammad-trigger-autowizard):"; \
-	echo "       $$AUTO_WIZ_URL"; \
-	echo ""; \
-	echo "  4. HTTP API token for MCP: make zammad-bootstrap-token NAMESPACE=$(NAMESPACE)"; \
-	echo "     If you ran this deploy via make helm-install-ticketing, token bootstrap runs next in that recipe—skip 3–4 if you see success below."; \
-	echo ""; \
-	echo "  5. Chat widget: Admin → Channels → Chat (agents must be available for the widget to appear)."; \
-	echo "  6. Main chart: zammad.enabled, zammad.url, credentials Secret (use helm-install-ticketing or manual Secret)."; \
-	echo ""; \
-	echo "  More: README.md, docs/HELM_EXPORT_ANSIBLE.md"
-	@echo ""
-
-.PHONY: undeploy-zammad
-undeploy-zammad:
-	@echo "Removing Zammad instance from namespace $(NAMESPACE)..."
-	@helm uninstall zammad -n $(NAMESPACE) --ignore-not-found 2>/dev/null || true
-	@echo "Waiting for pods to terminate, then removing Zammad PVCs..."
-	@sleep 5
-	@kubectl delete pvc -n $(NAMESPACE) -l app.kubernetes.io/instance=zammad --ignore-not-found 2>/dev/null || true
-	@for pvc in $$(kubectl get pvc -n $(NAMESPACE) -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E '^data-zammad-' || true); do kubectl delete pvc $$pvc -n $(NAMESPACE) --ignore-not-found; done
-	@echo "✅ Zammad instance removed successfully!"
-
-# Trigger autoWizard via HTTP (creates admin user). Run once before zammad-bootstrap-token.
-# Uses GET /api/v1/getting_started/auto_wizard/:token
-.PHONY: zammad-trigger-autowizard
-zammad-trigger-autowizard: namespace
-	@echo "Triggering autoWizard via HTTP..."; \
-	RES=$$(kubectl exec deploy/zammad-railsserver -n $(NAMESPACE) -- ruby -rnet/http -e 'uri=URI("http://zammad-nginx:8080/api/v1/getting_started/auto_wizard/$(ZAMMAD_AUTOWIZARD_TOKEN)");res=Net::HTTP.get_response(uri);puts res.code' 2>/dev/null) || RES=""; \
-	if [ "$$RES" = "200" ] || [ "$$RES" = "204" ]; then \
-		echo "✅ autoWizard triggered (HTTP $$RES). Waiting 5s for setup..."; \
-		sleep 5; \
-	else \
-		echo "⚠ autoWizard request returned HTTP $$RES (may already be done or system not ready)"; \
-	fi
-
-# Create Zammad API token via exec into railsserver (uses admin from autoWizard), update secret, restart MCP.
-# Idempotent: if secret already has a token, skips creation. Use ZAMMAD_FORCE_BOOTSTRAP=1 to recreate.
-.PHONY: zammad-bootstrap-token
-zammad-bootstrap-token: namespace zammad-trigger-autowizard
-	@ZAMMAD_URL="http://zammad-nginx.$(NAMESPACE).svc.cluster.local:8080"; \
-	ZAMMAD_TOKEN=$$(kubectl get secret $(ZAMMAD_CREDENTIALS_SECRET) -n $(NAMESPACE) -o jsonpath='{.data.zammad-http-token}' 2>/dev/null | base64 -d 2>/dev/null || true); \
-	if [ -n "$$ZAMMAD_TOKEN" ] && [ "$(ZAMMAD_FORCE_BOOTSTRAP)" != "1" ]; then \
-		echo "Secret already has token (idempotent). Use ZAMMAD_FORCE_BOOTSTRAP=1 to recreate."; \
-		exit 0; \
-	fi; \
-	echo "Creating Zammad API token via exec..."; \
-	ZAMMAD_TOKEN=$$(kubectl exec deploy/zammad-railsserver -n $(NAMESPACE) -- env ZAMMAD_ADMIN_EMAIL='$(ZAMMAD_ADMIN_EMAIL)' ZAMMAD_ADMIN_PASSWORD='$(ZAMMAD_ADMIN_PASSWORD)' ruby -rnet/http -rjson -e 'uri=URI("http://localhost:3000/api/v1/user_access_token");req=Net::HTTP::Post.new(uri);req.basic_auth(ENV["ZAMMAD_ADMIN_EMAIL"],ENV["ZAMMAD_ADMIN_PASSWORD"]);req["Content-Type"]="application/json";req.body=JSON.generate({"name"=>"mcp-agent","permission"=>["admin","ticket.agent"]});res=Net::HTTP.start(uri.hostname,uri.port){|h|h.request(req)};d=JSON.parse(res.body);t=d["token"];t ? puts(t) : ($$stderr.puts("Zammad API #{res.code}: #{res.body[0,500]}");exit 1)' ) || ZAMMAD_TOKEN=""; \
-	if [ -z "$$ZAMMAD_TOKEN" ]; then \
-		echo "❌ Token creation failed (401 = invalid credentials)."; \
-		echo "   Complete autoWizard first: visit <zammad-url>/#getting_started/auto_wizard/$(ZAMMAD_AUTOWIZARD_TOKEN)"; \
-		echo "   (Port-forward: kubectl port-forward -n $(NAMESPACE) svc/zammad-nginx 8080:8080, then http://localhost:8080/...)"; \
-		exit 1; \
-	fi; \
-	kubectl create secret generic $(ZAMMAD_CREDENTIALS_SECRET) \
-		--from-literal=zammad-url="$$ZAMMAD_URL/api/v1" \
-		--from-literal=zammad-http-token="$$ZAMMAD_TOKEN" \
-		-n $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -; \
-	echo "Restarting Zammad MCP..."; \
-	kubectl rollout restart deployment/mcp-zammad-mcp -n $(NAMESPACE); \
-	kubectl rollout status deployment/mcp-zammad-mcp -n $(NAMESPACE) --timeout=2m; \
-	echo "✅ Zammad token created and MCP restarted."
-
-# Update Zammad API token and restart MCP. Run after creating token in Zammad Admin → Token Access.
-# Update embed page with actual Zammad URL (fixes placeholder when embed shows YOUR-ZAMMAD-URL)
-.PHONY: zammad-update-embed-url
-zammad-update-embed-url: namespace
-	@ZAMMAD_ROUTE=$$(oc get route ssa-zammad -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null); \
-	if [ -z "$$ZAMMAD_ROUTE" ]; then \
-		ZAMMAD_ROUTE=$$(oc get route -n $(NAMESPACE) -l app.kubernetes.io/component=zammad -o jsonpath='{.items[0].spec.host}' 2>/dev/null); \
-	fi; \
-	if [ -z "$$ZAMMAD_ROUTE" ]; then \
-		ZAMMAD_ROUTE=$$(oc get route -n $(NAMESPACE) -l app.kubernetes.io/instance=zammad -o jsonpath='{.items[0].spec.host}' 2>/dev/null); \
-	fi; \
-	if [ -z "$$ZAMMAD_ROUTE" ]; then \
-		echo "❌ No Zammad Route found in $(NAMESPACE). Deploy Zammad and ensure ssa-zammad Route exists."; \
-		exit 1; \
-	fi; \
-	$(MAKE) _zammad-patch-embed-configmap NAMESPACE=$(NAMESPACE) ZAMMAD_ROUTE="$$ZAMMAD_ROUTE"; \
-	EMBED_HOST=$$(oc get route ssa-zammad-embed -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null); \
-	if [ -n "$$EMBED_HOST" ]; then echo "✅ Embed page updated. Visit https://$$EMBED_HOST to verify."; \
-	else echo "✅ Embed ConfigMap updated."; fi
-
-.PHONY: zammad-set-token
-zammad-set-token: namespace
-	@if [ -z "$(ZAMMAD_TOKEN)" ]; then \
-		echo "❌ Error: ZAMMAD_TOKEN is required."; \
-		echo "  1. Create token in Zammad: Admin → Token Access → add HTTP Token"; \
-		echo "  2. Run: make zammad-set-token NAMESPACE=$(NAMESPACE) ZAMMAD_TOKEN=<your-token>"; \
-		exit 1; \
-	fi
-	@ZAMMAD_URL="http://zammad-nginx.$(NAMESPACE).svc.cluster.local:8080"; \
-	echo "Updating Zammad credentials secret with token..."; \
-	kubectl create secret generic $(ZAMMAD_CREDENTIALS_SECRET) \
-		--from-literal=zammad-url="$$ZAMMAD_URL/api/v1" \
-		--from-literal=zammad-http-token="$(ZAMMAD_TOKEN)" \
-		-n $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -; \
-	echo "Restarting Zammad MCP deployment..."; \
-	kubectl rollout restart deployment/mcp-zammad-mcp -n $(NAMESPACE); \
-	kubectl rollout status deployment/mcp-zammad-mcp -n $(NAMESPACE) --timeout=2m; \
-	echo "✅ Zammad token set and MCP restarted."
+ZAMMAD_DEMO_SITE_ENABLED ?= true
+ZAMMAD_DEMO_SITE_PATH ?= demo-portal
 
 # ServiceNow PDI wake-up
 .PHONY: servicenow-wake-install
@@ -2269,3 +2252,63 @@ servicenow-bootstrap-create-evaluation-users:
 	@echo "Creating evaluation users..."
 	@cd scripts/servicenow-bootstrap && uv run python -m servicenow_bootstrap.create_evaluation_users
 	@echo "Evaluation users creation completed successfully!"
+
+# NeMo Guardrails deployment targets
+.PHONY: deploy-nemo-guardrails
+deploy-nemo-guardrails: namespace
+	@echo "Deploying NeMo Guardrails..."
+	@if ! oc get crd nemoguardrails.trustyai.opendatahub.io &>/dev/null; then \
+		echo "❌ NemoGuardrails CRD not found. Ensure RHOAI 3.3+ is installed with the TrustyAI operator enabled."; \
+		exit 1; \
+	fi
+	$(if $(filter true,$(JAILBREAK_DETECT)),$(if $(NGC_API_KEY),,$(error NGC_API_KEY is required when jailbreakDetect is enabled)),)
+	$(eval NEMO_ALREADY_DEPLOYED := $(shell oc get deployment nemo-guardrails -n $(NAMESPACE) &>/dev/null && echo yes || echo no))
+	@helm upgrade --install nemo-guardrails $(NEMO_GUARDRAILS_CHART) \
+		-n $(NAMESPACE) \
+		$(if $(NGC_API_KEY),--set ngcApiKey=$(NGC_API_KEY),) \
+		--set llm.url=http://llamastack:8321/v1 \
+		--set llm.modelId=$(LLM_ID) \
+		$(if $(filter true,$(JAILBREAK_DETECT)),--set jailbreakDetect.enabled=true,) \
+		$(if $(SAFETY_TOLERATION),--set jailbreakDetect.gpuToleration=$(SAFETY_TOLERATION),)
+	@if [ "$(NEMO_ALREADY_DEPLOYED)" = "yes" ]; then \
+		echo "Restarting NeMo Guardrails deployment to pick up configmap changes..."; \
+		oc rollout restart deployment/nemo-guardrails -n $(NAMESPACE); \
+		oc rollout status deployment/nemo-guardrails -n $(NAMESPACE) --timeout=3m || \
+			(echo "❌ NeMo Guardrails rollout did not complete" && exit 1); \
+	fi
+	@if [ "$(JAILBREAK_DETECT)" = "true" ]; then \
+		echo "Waiting for NemoGuard JailbreakDetect to be ready (pulls model from NGC on first start)..."; \
+		oc rollout status deployment/nemoguard-jailbreakdetect -n $(NAMESPACE) --timeout=15m || \
+			(echo "❌ NemoGuard JailbreakDetect not ready. Check: oc logs -n $(NAMESPACE) deployment/nemoguard-jailbreakdetect" && exit 1); \
+	fi
+	@echo "Waiting for NemoGuardrails CR to be ready..."
+	@oc wait nemoguardrails/nemo-guardrails -n $(NAMESPACE) \
+		--for=condition=Ready --timeout=5m 2>/dev/null || \
+		echo "  (NemoGuardrails CR ready check skipped — verify manually with: oc get nemoguardrails -n $(NAMESPACE))"
+	@echo "Enabling NeMo Guardrails raw message checks in agent-service..."
+	@oc set env deployment/self-service-agent-agent-service \
+		USE_NEMO_GUARDRAILS=true \
+		-n $(NAMESPACE)
+	@oc rollout restart deployment/self-service-agent-agent-service -n $(NAMESPACE)
+	@oc rollout status deployment/self-service-agent-agent-service -n $(NAMESPACE) --timeout=5m
+	@echo ""
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo "NeMo Guardrails deployed and enabled successfully"
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo ""
+
+.PHONY: undeploy-nemo-guardrails
+undeploy-nemo-guardrails:
+	@echo "Removing NeMo Guardrails..."
+	@echo "Disabling NeMo Guardrails raw message checks in agent-service..."
+	@oc set env deployment/self-service-agent-agent-service \
+		USE_NEMO_GUARDRAILS- \
+		-n $(NAMESPACE) 2>/dev/null || true
+	@oc rollout restart deployment/self-service-agent-agent-service -n $(NAMESPACE) 2>/dev/null || true
+	@oc rollout status deployment/self-service-agent-agent-service -n $(NAMESPACE) --timeout=5m 2>/dev/null || true
+	@helm uninstall nemo-guardrails -n $(NAMESPACE) --ignore-not-found 2>/dev/null || true
+	@if oc get pvc nemoguard-jailbreakdetect-cache -n $(NAMESPACE) &>/dev/null; then \
+		echo "  Deleting NIM model cache PVC..."; \
+		oc delete pvc nemoguard-jailbreakdetect-cache -n $(NAMESPACE) --wait=true; \
+	fi || true
+	@echo "NeMo Guardrails undeployed."

@@ -527,8 +527,9 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--test-script",
         type=str,
-        default="chat-responses-request-mgr.py",
-        help="Name of the test script to execute (default: chat-responses-request-mgr.py)",
+        default=None,
+        help="Name of the test script to execute (default: chat-responses-request-mgr.py, "
+        "or the flow's DEFAULT_TEST_SCRIPT when --flow is used)",
     )
     parser.add_argument(
         "--reset-conversation",
@@ -594,7 +595,8 @@ def _parse_arguments() -> argparse.Namespace:
         type=str,
         default=None,
         metavar="FLOW_NAME",
-        help="Run the evaluation pipeline for a specific flow (e.g., ticket_laptop_refresh). "
+        help="Run the evaluation pipeline for one or more flows, comma-separated "
+        "(e.g., ticket_laptop_refresh or ticket_laptop_refresh,ticket_unrelated). "
         "Uses flow-specific directories, metrics, and chatbot role.",
     )
     parser.add_argument(
@@ -988,7 +990,12 @@ def run_evaluation_pipeline(
         step_num += 1
         step_label = f"{step_num}/{step_total}"
         logger.info(f"📋 Step {step_label}: Running predefined conversation flows...")
-        run_conversations_args = ["--test-script", test_script]
+        run_conversations_args = [
+            "--test-script",
+            test_script,
+            "--message-timeout",
+            str(message_timeout),
+        ]
         if reset_conversation:
             run_conversations_args.append("--reset-conversation")
         if flow:
@@ -1141,12 +1148,54 @@ def main() -> int:
             logger.error("--flow and --all-flows are mutually exclusive")
             return 1
 
+        # Parse comma-separated flow names
+        flow_names = (
+            [f.strip() for f in args.flow.split(",") if f.strip()] if args.flow else []
+        )
+
+        import sys as _sys
+
+        _eval_dir = str(Path(__file__).parent)
+        if _eval_dir not in _sys.path:
+            _sys.path.insert(0, _eval_dir)
+
+        # Resolve test_script and reset_conversation from flow defaults (single flow only)
+        if len(flow_names) == 1:
+            from flow_registry import load_flow as _load_flow
+
+            _flow_module = _load_flow(flow_names[0])
+            test_script = args.test_script or getattr(
+                _flow_module, "DEFAULT_TEST_SCRIPT", "chat-responses-request-mgr.py"
+            )
+            reset_conversation = args.reset_conversation or getattr(
+                _flow_module, "DEFAULT_RESET_CONVERSATION", False
+            )
+        else:
+            test_script = args.test_script or "chat-responses-request-mgr.py"
+            reset_conversation = args.reset_conversation
+
         if args.check:
+            if len(flow_names) > 1:
+                overall = 0
+                for flow_name in flow_names:
+                    logger.info(
+                        f"=== Checking known bad conversations for flow '{flow_name}' ==="
+                    )
+                    overall = max(
+                        overall,
+                        run_check_known_bad_conversations(
+                            timeout=args.timeout,
+                            validate_full_laptop_details=args.validate_full_laptop_details,
+                            use_structured_output=args.use_structured_output,
+                            flow=flow_name,
+                        ),
+                    )
+                return overall
             return run_check_known_bad_conversations(
                 timeout=args.timeout,
                 validate_full_laptop_details=args.validate_full_laptop_details,
                 use_structured_output=args.use_structured_output,
-                flow=args.flow,
+                flow=flow_names[0] if flow_names else None,
             )
 
         if args.all_flows:
@@ -1162,8 +1211,8 @@ def main() -> int:
                 num_conversations=args.num_conversations,
                 timeout=args.timeout,
                 max_turns=args.max_turns,
-                test_script=args.test_script,
-                reset_conversation=args.reset_conversation,
+                test_script=test_script,
+                reset_conversation=reset_conversation,
                 concurrency=args.concurrency,
                 message_timeout=args.message_timeout,
                 validate_full_laptop_details=args.validate_full_laptop_details,
@@ -1188,12 +1237,79 @@ def main() -> int:
 
             return overall
 
+        if len(flow_names) > 1:
+            from flow_registry import get_flow_paths as _get_flow_paths
+            from flow_registry import load_flow as _load_flow
+
+            overall = 0
+            for flow_name in flow_names:
+                logger.info(f"=== Running pipeline for flow '{flow_name}' ===")
+                _flow_module = _load_flow(flow_name)
+                _test_script = args.test_script or getattr(
+                    _flow_module, "DEFAULT_TEST_SCRIPT", "chat-responses-request-mgr.py"
+                )
+                _reset_conversation = args.reset_conversation or getattr(
+                    _flow_module, "DEFAULT_RESET_CONVERSATION", False
+                )
+                overall = max(
+                    overall,
+                    run_evaluation_pipeline(
+                        num_conversations=args.num_conversations,
+                        timeout=args.timeout,
+                        max_turns=args.max_turns,
+                        test_script=_test_script,
+                        reset_conversation=_reset_conversation,
+                        concurrency=args.concurrency,
+                        message_timeout=args.message_timeout,
+                        validate_full_laptop_details=args.validate_full_laptop_details,
+                        use_structured_output=args.use_structured_output,
+                        conversation_source=args.conversation_source,
+                        start_date=args.start_date,
+                        end_date=args.end_date,
+                        flow=flow_name,
+                    ),
+                )
+
+            # Print combined summary across all flows
+            from helpers.deep_eval_summary import print_final_summary as _print_summary
+
+            combined_results: List[Dict[str, Any]] = []
+            combined_failed: List[Dict[str, Any]] = []
+            combined_total = 0
+            combined_successful = 0
+            for flow_name in flow_names:
+                _paths = _get_flow_paths(flow_name)
+                _results_file = _paths.results_eval_dir / "deepeval_all_results.json"
+                if _results_file.exists():
+                    try:
+                        _data = json.loads(_results_file.read_text())
+                        combined_results.extend(_data.get("successful_evaluations", []))
+                        combined_failed.extend(_data.get("failed_evaluations", []))
+                        combined_total += _data.get("total_files", 0)
+                        combined_successful += _data.get("successful_count", 0)
+                    except Exception:
+                        pass
+
+            if combined_results or combined_failed:
+                print("\n" + "=" * 60)
+                print(f"  COMBINED SUMMARY: {', '.join(flow_names)}")
+                print("=" * 60)
+                _print_summary(
+                    total_files=combined_total,
+                    successful_evaluations=combined_successful,
+                    all_results=combined_results,
+                    failed_evaluations=combined_failed or None,
+                    output_dir="(multiple flows)",
+                )
+
+            return overall
+
         return run_evaluation_pipeline(
             num_conversations=args.num_conversations,
             timeout=args.timeout,
             max_turns=args.max_turns,
-            test_script=args.test_script,
-            reset_conversation=args.reset_conversation,
+            test_script=test_script,
+            reset_conversation=reset_conversation,
             concurrency=args.concurrency,
             message_timeout=args.message_timeout,
             validate_full_laptop_details=args.validate_full_laptop_details,
@@ -1201,7 +1317,7 @@ def main() -> int:
             conversation_source=args.conversation_source,
             start_date=args.start_date,
             end_date=args.end_date,
-            flow=args.flow,
+            flow=flow_names[0] if flow_names else None,
         )
     except KeyboardInterrupt:
         logger.warning("⚠️  Pipeline interrupted by user")

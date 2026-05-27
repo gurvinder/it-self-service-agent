@@ -5,7 +5,7 @@ Transform IT service delivery using AI to lower support effort, improve complian
 ## Table of contents
 
 - [Detailed description](#detailed-description)
-  - [Related blog posts](#related-blog-posts)
+  - [Related content](#related-content)
   - [Who is this for?](#who-is-this-for)
   - [The business case for AI-driven IT self-service](#the-business-case-for-ai-driven-it-self-service)
   - [Example use cases](#example-use-cases)
@@ -55,9 +55,19 @@ This quickstart guide is designed for:
 - **Solution architects** evaluating AI automation platforms
 - **Organizations** looking to streamline IT processes with generative AI
 
-### Related blog posts
+### Related content
 
-If you would like to read blog posts related to the quickstart before diving into the details, here are two good starting points:
+Before diving into the details, you may want to start with the demo and related articles.
+
+**Demo video:** [Build a self-service AI agent with OpenShift AI](https://www.youtube.com/watch?v=UZ-tqXzRWFc)
+
+<p>
+  <a href="https://www.youtube.com/watch?v=UZ-tqXzRWFc">
+    <img src="https://img.youtube.com/vi/UZ-tqXzRWFc/hqdefault.jpg" width="480" alt="Video thumbnail: Build a self-service AI agent with OpenShift AI">
+  </a>
+</p>
+
+**Related reading**
 
 - Blog post with business value overview: [From manual to agentic: streamlining IT processes with Red Hat OpenShift AI](https://www.redhat.com/en/blog/manual-agentic-streamlining-it-processes-red-hat-openshift-ai)
 - Technical insights blog post series: [AI quickstart: Self-service agent for IT process automation](https://developers.redhat.com/articles/2026/01/26/ai-quickstart-self-service-agent-it-process-automation)
@@ -320,7 +330,9 @@ The following are the resources you need to add on top of your existing OpenShif
 ### Minimum software requirements
 
 **Local Tools:**
-* [Python 3.12+](https://www.python.org/downloads/)
+* [Python 3.12 - 3.13](https://www.python.org/downloads/)
+**Note:** Python 3.12 is the minimum supported version since it requires modern Python features and type hints that are not available in earlier versions. Python 3.13 is the maximum supported version since the `grpcio` library doesn't have pre-compiled binary packages for versions later than 3.13 yet.
+
 * [uv](https://github.com/astral-sh/uv) - Fast Python package installer (version 0.8.9 required to match CI)
   * Install specific version: `curl -LsSf https://astral.sh/uv/0.8.9/install.sh | sh`
   * Update to latest: `uv self update` (may install newer version)
