@@ -1448,6 +1448,12 @@ test-short-ticket-laptop-refresh:
 	uv --directory evaluations run evaluate.py --message-timeout 1800 --timeout=1800 -n 1 --flow ticket_laptop_refresh,ticket_unrelated $(VALIDATE_LAPTOP_DETAILS_FLAG) $(STRUCTURED_OUTPUT_FLAG)
 	@echo "short responses integration test for ticket-laptop-refresh flow completed successfully!"
 
+.PHONY: test-long-ticket-laptop-refresh
+test-long-ticket-laptop-refresh:
+	@echo "Running ticket-laptop-refresh evaluation (10 conversations)..."
+	uv --directory evaluations run evaluate.py --message-timeout 1800 --timeout=1800 -n 10 --flow ticket_laptop_refresh,ticket_unrelated $(VALIDATE_LAPTOP_DETAILS_FLAG) $(STRUCTURED_OUTPUT_FLAG)
+	@echo "ticket-laptop-refresh evaluation completed successfully!"
+
 .PHONY: test-short-resp-integration-request-mgr
 test-short-resp-integration-request-mgr:
 	@echo "Running short responses integration test with Request Manager..."
@@ -1629,7 +1635,7 @@ define helm_install_common
 	done
 	@(kubectl get deploy/$(MAIN_CHART_NAME)-mock-eventing -n $(NAMESPACE) >/dev/null 2>&1 && echo "Waiting for mock eventing deployment..." && kubectl rollout status deploy/$(MAIN_CHART_NAME)-mock-eventing -n $(NAMESPACE) --timeout 5m || echo "Skipping mock eventing (not deployed)") && (kubectl get deploy/$(MAIN_CHART_NAME)-mock-servicenow -n $(NAMESPACE) >/dev/null 2>&1 && echo "Waiting for mock ServiceNow..." && kubectl rollout status deploy/$(MAIN_CHART_NAME)-mock-servicenow -n $(NAMESPACE) --timeout 5m || echo "Skipping mock ServiceNow (not deployed)")
 	$(if $(filter true,$(PROMPTGUARD_ENABLED)),@echo "Waiting for PromptGuard deployment..." && kubectl rollout status deploy/$(MAIN_CHART_NAME)-promptguard -n $(NAMESPACE) --timeout 10m,)
-	$(if $(filter true,$(ENABLE_LANGFUSE)),@echo "Waiting for Redis StatefulSet..." && kubectl rollout status statefulset/$(MAIN_CHART_NAME)-redis -n $(NAMESPACE) --timeout 10m && echo "Waiting for MinIO StatefulSet..." && kubectl rollout status statefulset/$(MAIN_CHART_NAME)-minio -n $(NAMESPACE) --timeout 10m && echo "Waiting for ClickHouse StatefulSet..." && kubectl rollout status statefulset/$(MAIN_CHART_NAME)-clickhouse -n $(NAMESPACE) --timeout 10m && echo "Waiting for LangFuse Web deployment..." && kubectl rollout status deploy/$(MAIN_CHART_NAME)-langfuse -n $(NAMESPACE) --timeout 10m && echo "Waiting for LangFuse Worker deployment (runs ClickHouse migrations)..." && kubectl rollout status deploy/$(MAIN_CHART_NAME)-langfuse-worker -n $(NAMESPACE) --timeout 10m && echo "LangFuse URL: https://$$(kubectl get route $(MAIN_CHART_NAME)-langfuse -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null || echo 'Route not found')",)
+	$(if $(filter true,$(ENABLE_LANGFUSE)),@echo "Waiting for Redis StatefulSet..." && kubectl rollout status statefulset/$(MAIN_CHART_NAME)-langfuse-redis -n $(NAMESPACE) --timeout 10m && echo "Waiting for MinIO StatefulSet..." && kubectl rollout status statefulset/$(MAIN_CHART_NAME)-minio -n $(NAMESPACE) --timeout 10m && echo "Waiting for ClickHouse StatefulSet..." && kubectl rollout status statefulset/$(MAIN_CHART_NAME)-clickhouse -n $(NAMESPACE) --timeout 10m && echo "Waiting for LangFuse Web deployment..." && kubectl rollout status deploy/$(MAIN_CHART_NAME)-langfuse -n $(NAMESPACE) --timeout 10m && echo "Waiting for LangFuse Worker deployment (runs ClickHouse migrations)..." && kubectl rollout status deploy/$(MAIN_CHART_NAME)-langfuse-worker -n $(NAMESPACE) --timeout 10m && echo "LangFuse URL: https://$$(kubectl get route $(MAIN_CHART_NAME)-langfuse -n $(NAMESPACE) -o jsonpath='{.spec.host}' 2>/dev/null || echo 'Route not found')",)
 	@echo "$(MAIN_CHART_NAME) $(1) installed successfully"
 endef
 

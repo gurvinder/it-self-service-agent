@@ -7,15 +7,30 @@
     "conversation": [
         {
             "role": "user",
-            "content": "My work email stopped syncing on my phone this morning"
+            "content": "My work email stopped syncing on my phone this morning",
+            "expected_conversation_metadata": {
+                "state": "open",
+                "owner": "agent.general",
+                "group": "Users"
+            }
         },
         {
             "role": "user",
-            "content": "I've already tried removing and re-adding the account but it still isn't working"
+            "content": "I've already tried removing and re-adding the account but it still isn't working",
+            "expected_conversation_metadata": {
+                "state": "open",
+                "owner": "agent.general",
+                "group": "Users"
+            }
         },
         {
             "role": "user",
-            "content": "Please escalate this ticket, I need someone to take a proper look"
+            "content": "Please escalate this ticket, I need someone to take a proper look",
+            "expected_conversation_metadata": {
+                "state": "open",
+                "owner": "-",
+                "group": "human_managed_tickets"
+            }
         }
     ]
 }
