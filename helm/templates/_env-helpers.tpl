@@ -115,7 +115,7 @@ Generate common environment variables for all services
 - name: SQL_DEBUG
   value: "false"
 - name: EXPECTED_MIGRATION_VERSION
-  value: {{ .Values.database.expectedMigrationVersion | default "002" | quote }}
+  value: {{ .Values.database.expectedMigrationVersion | default "003" | quote }}
 {{/* Eventing Configuration - Always enabled (mock or full Knative) */}}
 - name: BROKER_URL
   value: {{ if .Values.requestManagement.knative.eventing.enabled }}{{ printf "%s/%s/%s" .Values.requestManagement.knative.broker.url .Release.Namespace .Values.requestManagement.knative.broker.name | quote }}{{ else }}{{ printf "http://%s-mock-eventing.%s.svc.cluster.local:8080/%s/%s" (include "self-service-agent.fullname" .) .Release.Namespace .Release.Namespace .Values.requestManagement.knative.broker.name | quote }}{{ end }}
@@ -208,6 +208,19 @@ Generate Request Manager specific environment variables
   value: {{ if and (hasKey .Values.requestManagement "requestManager") (hasKey .Values.requestManagement.requestManager "sessionSerialization") (hasKey .Values.requestManagement.requestManager.sessionSerialization "backgroundReclaimIntervalSeconds") }}{{ .Values.requestManagement.requestManager.sessionSerialization.backgroundReclaimIntervalSeconds | quote }}{{ else }}"45"{{ end }}
 - name: RECLAIM_ACTION
   value: {{ if and (hasKey .Values.requestManagement "requestManager") (hasKey .Values.requestManagement.requestManager "sessionSerialization") (hasKey .Values.requestManagement.requestManager.sessionSerialization "reclaimAction") }}{{ .Values.requestManagement.requestManager.sessionSerialization.reclaimAction | quote }}{{ else }}"requeue"{{ end }}
+{{/* Channel behavior: Helm partial overrides + optional DB merge at session create */}}
+{{- $cb := dict }}
+{{- if and (hasKey .Values.requestManagement "requestManager") (hasKey .Values.requestManagement.requestManager "channelBehavior") }}
+{{- $cb = .Values.requestManagement.requestManager.channelBehavior }}
+{{- end }}
+{{- if $cb.allowDbOverride }}
+- name: CHANNEL_BEHAVIOR_ALLOW_DB_OVERRIDE
+  value: {{ $cb.allowDbOverride | quote }}
+{{- end }}
+{{- if $cb.overrides }}
+- name: CHANNEL_BEHAVIOR_OVERRIDES
+  value: {{ $cb.overrides | toJson | quote }}
+{{- end }}
 {{/* DB pool overrides are applied in dbEnvVarsNoStatementTimeout (single source to avoid duplicate env vars) */}}
 {{- include "self-service-agent.sessionAgentRoutingEnvVars" . }}
 {{/* Zammad REST: same credentials secret as integration-dispatcher/MCP (oc exec ticket harness, optional future RM features) */}}
@@ -225,13 +238,11 @@ Generate Request Manager specific environment variables
 {{- end }}
 {{- end }}
 
-{{/* DEFAULT_AGENT_ID / ZAMMAD_DEFAULT_AGENT_ID — session first-agent routing */}}
+{{/* DEFAULT_AGENT_ID — global router and default entry; per-channel entry from CHANNEL_REGISTRY (Helm channelBehavior.overrides / optional DB when allowDbOverride) */}}
 {{- define "self-service-agent.sessionAgentRoutingEnvVars" -}}
 {{- $agent := .Values.agent | default dict }}
 - name: DEFAULT_AGENT_ID
   value: {{ $agent.defaultAgentId | default "routing-agent" | quote }}
-- name: ZAMMAD_DEFAULT_AGENT_ID
-  value: {{ $agent.zammadDefaultAgentId | default "ticket-review-agent" | quote }}
 {{- end }}
 
 {{/*
@@ -292,39 +303,6 @@ Generate Agent Service specific environment variables
 - name: {{ $key | upper | replace "-" "_" }}
   value: {{ $value | quote }}
 {{- end }}
-{{- end }}
-{{/* Safety/Shield Configuration */}}
-{{- $safetyModel := "" }}
-{{- $safetyUrl := "" }}
-{{/* Check if safety is configured in values.yaml */}}
-{{- if hasKey .Values "safety" }}
-{{- if .Values.safety.model }}
-{{- $safetyModel = .Values.safety.model }}
-{{- end }}
-{{- if .Values.safety.url }}
-{{- $safetyUrl = .Values.safety.url }}
-{{- end }}
-{{- end }}
-{{/* Check for enabled models in global.models (from Makefile) */}}
-{{- if hasKey .Values "global" }}
-{{- if hasKey .Values.global "models" }}
-{{- range $modelName, $modelConfig := .Values.global.models }}
-{{- if and (hasKey $modelConfig "enabled") $modelConfig.enabled (hasKey $modelConfig "url") }}
-{{/* Check if this looks like a safety/guard model */}}
-{{- if or (contains "guard" ($modelName | lower)) (contains "safety" ($modelName | lower)) }}
-{{- $safetyModel = $modelName }}
-{{- $safetyUrl = $modelConfig.url }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{/* Only set environment variables if both model and URL are configured */}}
-{{- if and $safetyModel $safetyUrl }}
-- name: SAFETY
-  value: {{ $safetyModel | quote }}
-- name: SAFETY_URL
-  value: {{ $safetyUrl | quote }}
 {{- end }}
 {{/* NeMo Guardrails Configuration */}}
 {{- if and (hasKey .Values "nemoGuardrails") .Values.nemoGuardrails.enabled }}

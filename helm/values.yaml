@@ -13,12 +13,11 @@ image:
   integrationDispatcher: self-service-agent-integration-dispatcher
   mockEventing: self-service-agent-mock-eventing
   mockServiceNow: self-service-agent-mock-servicenow
-  promptGuard: self-service-agent-promptguard
   # This sets the pull policy for images.
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
   # Anchor: bump once here; subchart defaults (e.g. mcp-servers Snow) alias this tag.
-  tag: &releaseImageTag "0.0.13"
+  tag: &releaseImageTag "0.0.14"
 
 # Test Integration Configuration
 testIntegrationEnabled: false
@@ -29,9 +28,10 @@ testIntegrationEnabled: false
 
 # Database Configuration
 database:
-  # Expected migration version that services should wait for
-  expectedMigrationVersion: "002"
-  
+  # Override only if services must wait for a version other than the chart default
+  # (helm/templates/_env-helpers.tpl → EXPECTED_MIGRATION_VERSION, default "003").
+  # expectedMigrationVersion: "003"
+
   # Database connection URL - leave empty to use default pgvector service
   # Format: postgresql://username:password@host:port/database
   url: ""  # Uses default: postgresql://postgres:rag_password@self-service-agent-pgvector:5432/postgres
@@ -129,46 +129,6 @@ llamastack:
 nemoGuardrails:
   enabled: false
 
-# Safety/Shield Configuration (Llama Guard)
-safety:
-  # Model name for safety checks (e.g., llama-guard-3-8b)
-  # Leave empty to disable shields
-  model: ""
-  # URL for safety model endpoint
-  # Leave empty to disable shields
-  url: ""
-
-# PromptGuard Service Configuration (Attack Detection Shield)
-promptGuard:
-  enabled: false  # Set to true to enable PromptGuard service
-  replicas: 1
-  logLevel: "INFO"
-  uvicornWorkers: 1  # Single worker sufficient for CPU-based model
-  # This is the default value. It will be overridden if PROMPTGUARD_MODEL_ID is passed via the Makefile/Helm command.
-  modelId: "meta-llama/Llama-Prompt-Guard-2-86M"
-  huggingfaceToken: "" 
-  resources:
-    limits:
-      cpu: "2"
-      memory: 2Gi  # 86M model is very lightweight
-    requests:
-      cpu: "1"
-      memory: 1Gi
-  # Health check configuration (CPU model loads faster than GPU models)
-  healthChecks:
-    livenessProbe:
-      initialDelaySeconds: 45  # Allow time for model download/loading
-      periodSeconds: 30
-      timeoutSeconds: 5
-      failureThreshold: 3
-      successThreshold: 1
-    readinessProbe:
-      initialDelaySeconds: 30  # Model loading time
-      periodSeconds: 15
-      timeoutSeconds: 5
-      failureThreshold: 3
-      successThreshold: 1
-
 # PostgreSQL configuration for llama-stack agent persistence
 # max_connections=200 for all envs; unified pool sizes (test/prod same).
 pgvector:
@@ -245,18 +205,6 @@ llama-stack:
             responses:
               backend: sql_default
               table_name: responses
-
-  # Model configurations for llama-stack
-  # Add PromptGuard as a shield when enabled
-  models:
-    llama-prompt-guard-2-86m:
-      id: "meta-llama/Llama-Prompt-Guard-2-86M"
-      enabled: false
-      registerShield: true
-      # URL is set dynamically via Makefile
-      url: ""
-      apiToken: "fake"
-      maxTokens: 512
 
 mcp-servers:
   enabled: true
@@ -495,6 +443,15 @@ requestManagement:
       # When "true", uses eventing with atomic claiming to prevent race conditions
       # Falls back to direct DB access if events fail or timeout
       useSessionEventing: "true"
+    # Partial channel behavior policy over CHANNEL_REGISTRY (request-manager only).
+    # See docs/CHANNEL_BEHAVIOR.md — prefer registry edits for product defaults.
+    channelBehavior:
+      allowDbOverride: false
+      overrides: {}
+      # Example — isolate Slack from the web unified session pool:
+      # overrides:
+      #   SLACK:
+      #     session_isolated_by_integration_type: true
     # External Access Configuration
     externalAccess:
       enabled: false  # Set to true to create external access via OpenShift Route
@@ -565,10 +522,8 @@ requestManagement:
   
   # Agent Configuration
   agent:
-    # First agent for most channels (Slack, web, email, …); see zammadDefaultAgentId for Zammad.
+    # Global router and default entry when channel_behavior.entry_agent_id is null.
     defaultAgentId: "routing-agent"
-    # First agent for IntegrationType.ZAMMAD sessions (never falls back to defaultAgentId).
-    zammadDefaultAgentId: "ticket-review-agent"
     # Agent response timeout in seconds
     timeout: 180
     # Always refresh agent mapping from LlamaStack on each request
@@ -854,7 +809,7 @@ langfuse:
       memory: "512Mi"
       cpu: "250m"
     limits:
-      memory: "1Gi"
+      memory: "2Gi"
       cpu: "500m"
 
   # Health checks
